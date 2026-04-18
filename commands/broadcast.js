@@ -1,31 +1,32 @@
 // ============================================================
 //  VANGUARD MD — commands/broadcast.js
-//  Media + Text Broadcast to ALL groups (Inbox only)
+//  Full Media + Text Broadcast (Inbox Only)
 // ============================================================
 
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys')
-const { isSudo } = require('../lib/utils')
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5MB
 
 module.exports = async (ctx) => {
-  const { sock, jid, msg, quoted, args, reply, fromGroup } = ctx
+  const { sock, jid, msg, quoted, args, reply, fromGroup, isOwner, isSudo } = ctx
 
-  // Permission
-  if (!isSudo) return reply('❌ *Access Denied:* Only Sudo/Owner can use this command.')
+  // ── Permission Check (Same as your .mode command) ─────────────────
+  if (!isOwner && !isSudo) {
+    return reply('❌ Only Owner & Sudo can use this command!')
+  }
 
-  // Must be used in inbox only
+  // ── Must be used in Inbox only ───────────────────────────────────
   if (fromGroup) {
-    return reply('❌ This command can only be used in **private chat** with the bot (inbox).')
+    return reply('❌ This command can only be used in **private chat** (inbox) with the bot.')
   }
 
   let caption = args.join(' ').trim()
 
   if (!quoted) {
-    return reply('❌ Reply to a media message or type text after .broadcast')
+    return reply('❌ Reply to any media (image/video/audio/sticker) or type text after .broadcast')
   }
 
-  // Determine media type and download buffer
+  // ── Extract Media ───────────────────────────────────────────────
   const quotedMsg = quoted.message
   let mediaType = null
   let buffer = null
@@ -52,21 +53,20 @@ module.exports = async (ctx) => {
     return reply('❌ Reply to an image, video, audio, or sticker!')
   }
 
-  // Check file size
+  // Size check
   if (buffer.length > MAX_FILE_SIZE) {
-    return reply(`❌ Media is too big!\nMaximum allowed size is 5MB.`)
+    return reply('❌ Media is too big! Maximum allowed is 5MB.')
   }
 
   // Caption priority
   if (!caption) {
-    // Use caption from quoted media if available
-    if (quotedMsg.imageMessage?.caption) caption = quotedMsg.imageMessage.caption
-    else if (quotedMsg.videoMessage?.caption) caption = quotedMsg.videoMessage.caption
-    else if (quotedMsg.audioMessage?.caption) caption = quotedMsg.audioMessage.caption
-    else caption = '> Vanguard MD is on Fire 🔥'
+    caption = quotedMsg.imageMessage?.caption ||
+              quotedMsg.videoMessage?.caption ||
+              quotedMsg.audioMessage?.caption ||
+              '> Vanguard MD is on Fire 🔥'
   }
 
-  // Fetch all groups
+  // ── Fetch all groups ─────────────────────────────────────────────
   let groups = {}
   try {
     groups = await sock.groupFetchAllParticipating()
@@ -88,19 +88,17 @@ module.exports = async (ctx) => {
     const [groupJid] = groupList[i]
 
     try {
-      const options = { quoted: msg }
-
       if (mediaType === 'image') {
-        await sock.sendMessage(groupJid, { image: buffer, caption }, options)
+        await sock.sendMessage(groupJid, { image: buffer, caption })
       } 
       else if (mediaType === 'video') {
-        await sock.sendMessage(groupJid, { video: buffer, caption, mimetype: 'video/mp4' }, options)
+        await sock.sendMessage(groupJid, { video: buffer, caption, mimetype: 'video/mp4' })
       } 
       else if (mediaType === 'audio') {
-        await sock.sendMessage(groupJid, { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: false }, options)
+        await sock.sendMessage(groupJid, { audio: buffer, mimetype: 'audio/ogg; codecs=opus' })
       } 
       else if (isSticker) {
-        await sock.sendMessage(groupJid, { sticker: buffer }, options)
+        await sock.sendMessage(groupJid, { sticker: buffer })
       }
 
       sent++
@@ -109,8 +107,8 @@ module.exports = async (ctx) => {
       console.error(`Broadcast failed to ${groupJid}:`, err.message)
     }
 
-    // Progress update every 10 groups
-    if ((i + 1) % 10 === 0 || i === groupList.length - 1) {
+    // Progress update
+    if ((i + 1) % 8 === 0 || i === groupList.length - 1) {
       const percent = Math.round(((i + 1) / groupList.length) * 100)
       await sock.sendMessage(jid, {
         text: `📤 Broadcasting...\nProgress: ${percent}%\nSent: ${sent} | Failed: ${failed}`,
@@ -118,8 +116,7 @@ module.exports = async (ctx) => {
       })
     }
 
-    // Small delay to avoid rate limit
-    await new Promise(r => setTimeout(r, 800))
+    await new Promise(r => setTimeout(r, 900)) // safe delay
   }
 
   // Final Report
