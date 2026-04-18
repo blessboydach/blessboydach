@@ -4,7 +4,7 @@
 // ============================================================
 
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys')
-const { isOwner, isSudoUser } = require('../lib/utils')
+const { isSudo } = require('../lib/utils')
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5MB
 
@@ -12,7 +12,7 @@ module.exports = async (ctx) => {
   const { sock, jid, msg, quoted, args, reply, fromGroup } = ctx
 
   // Permission
-  if (!isOwner && !isSudoUser) return reply('❌ Only Owner & Sudo can use this command!')
+  if (!isSudo) return reply('❌ *Access Denied:* Only Sudo/Owner can use this command.')
 
   // Must be used in inbox only
   if (fromGroup) {
