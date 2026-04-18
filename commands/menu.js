@@ -307,6 +307,7 @@ const menu =
 '│★ ' + p + 'qrcode\n' +
 '│★ ' + p + 'sentence\n' +
 '│★ ' + p + 'shazam\n' +
+'│★ ' + p + 'ss\n' +
 '│★ ' + p + 'steal\n' +
 '│★ ' + p + 'sticker\n' +
 '│★ ' + p + 'stream\n' +
