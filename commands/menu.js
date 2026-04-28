@@ -84,7 +84,7 @@ const menu =
 '┃ 💾 *Host:* Panel\n' +
 '┃ ⚡ *Speed:* ' + ping + '\n' +
 '┃ 💿 *Ram* : [' + progressBar + '] ' + ramPercent + '%\n' +
-'┃ 💻 *Version:* 2.1.8\n' +
+'┃ 💻 *Version:* 2.1.9\n' +
 '┃ 🛡️ *Mode:* ' + mode.toUpperCase() + '\n' +
 '┃ 🕐 *Time:* ' + time + '\n' +
 '┃ ⏱️ *Uptime:* ' + uptime + '\n' +
