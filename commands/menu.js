@@ -134,6 +134,8 @@ const menu =
 '│★ ' + p + 'vanguardspam\n' +
 '│★ ' + p + 'vanguardspam2\n' +
 '│★ ' + p + 'vanguardspam3\n' +
+'│★ ' + p + 'vangtag\n' +
+'│★ ' + p + 'vangsend\n' +
 '│★ ' + p + 'vv\n' +
 '│★ ' + p + 'vv2\n' +
 '╰─┬────────❍\n' +
@@ -215,6 +217,7 @@ const menu =
 // ── 5. INFO ───────────────────────────────────────────────
 '╭─┴❍「 📡 INFO 」❍\n' +
 '│★ ' + p + 'alive\n' +
+'│★ ' + p + 'alljid\n' +
 '│★ ' + p + 'botstatus\n' +
 '│★ ' + p + 'check\n' +
 '│★ ' + p + 'device\n' +
