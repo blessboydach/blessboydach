@@ -1,0 +1,24 @@
+// ============================================================
+//  VANGUARD MD — commands/ping.js
+// ============================================================
+
+const config   = require('../config')
+const defaults = require('../defaults')
+
+module.exports = async (ctx) => {
+  const { sock, jid, msg } = ctx
+
+  const botName = config.botName || defaults.botName || 'VANGUARD MD'
+  const start   = Date.now()
+
+  const sent = await sock.sendMessage(jid, {
+    text: '🔸 Pong !🔹'
+  }, { quoted: msg })
+
+  const ms = Date.now() - start
+
+  await sock.sendMessage(jid, {
+    text:  '🔸 *' + botName + '* 🔹\n⚡️ *Speed:* ' + ms + ' ms',
+    edit:  sent.key,
+  })
+}
