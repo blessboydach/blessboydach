@@ -1,16 +1,46 @@
+
 // ============================================================
 //  VANGUARD MD — commands/delete.js
 // ============================================================
 
-const { isBotAdmin } = require('../lib/utils')
+const { isBotAdmin, isSenderAdmin } = require('../lib/utils')
 const { getStoredMessages } = require('../lib/messageStore')
+const config   = require('../config')
+const defaults = require('../defaults')
 
 const MAX_BULK = 100
 
 module.exports = async (ctx) => {
-  const { sock, msg, jid, reply, quoted, args, fromGroup, fromMe, isSudo, senderNum, mentions, prefix } = ctx
+  const {
+    sock, msg, jid, reply, quoted, args,
+    fromGroup, fromMe, isSudo, senderNum, sender,
+    mentions, prefix,
+  } = ctx
 
-  if (!isSudo) return reply('❌ Only sudo/owner can use this command!')
+  // ── Access check ──────────────────────────────────────────
+  // Sudo/owner always allowed.
+  // In public mode, group admins are allowed too — but only in groups.
+  const mode = (config.mode || defaults.mode || 'public').toLowerCase()
+
+  let canUse = isSudo
+
+  if (!canUse && fromGroup && mode === 'public') {
+    canUse = await isSenderAdmin(sock, jid, sender)
+  }
+
+  if (!canUse) {
+    return reply('❌ Only sudo/owner can use this command!')
+  }
+
+  // ── Bot must be admin to delete others' messages in groups ─
+  const checkBotAdmin = async () => {
+    const botAdmin = await isBotAdmin(sock, jid)
+    if (!botAdmin) {
+      await reply('❌ I need to be an admin to delete messages!')
+      return false
+    }
+    return true
+  }
 
   const firstArg  = args[0]
   const bulkCount = firstArg && /^\d+$/.test(firstArg) ? parseInt(firstArg) : null
@@ -32,11 +62,14 @@ module.exports = async (ctx) => {
   //  MODE 1 — Quoted delete
   // ════════════════════════════════════════════════════════
   if (quoted && !bulkCount) {
-    const isOwnMsg = quoted.sender
-      ? quoted.sender.replace(/:[0-9]+@/, '@').replace('@s.whatsapp.net', '') === senderNum
-      : false
+    const quotedSenderNum = (quoted.sender || '')
+      .replace(/:[0-9]+@/, '@')
+      .replace('@s.whatsapp.net', '')
 
-    if (isOwnMsg || fromMe) {
+    const isOwnMsg = quotedSenderNum === senderNum || fromMe
+
+    // Deleting own message — no admin check needed
+    if (isOwnMsg) {
       const ok = await deleteMsg({
         remoteJid: jid, id: quoted.stanzaId, fromMe: true, participant: quoted.sender,
       })
@@ -47,17 +80,18 @@ module.exports = async (ctx) => {
       return
     }
 
+    // Deleting someone else's message in a group
     if (fromGroup) {
-      const botAdmin = await isBotAdmin(sock, jid)
-      if (!botAdmin) return reply('❌ I need to be an admin to delete others\' messages!')
+      if (!(await checkBotAdmin())) return
 
       const stored = getStoredMessages(jid)
       const exists = stored?.find(m => m.id === quoted.stanzaId)
-      if (!exists) return reply(
-        '⚠️ *NOT IN MEMORY*\n' +
-        '_This message is too old or was sent before deployement._\n' +
-        ''
-      )
+      if (!exists) {
+        return reply(
+          '⚠️ *NOT IN MEMORY*\n' +
+          '_This message is too old or was sent before deployment._'
+        )
+      }
 
       const ok = await deleteMsg({
         remoteJid: jid, id: quoted.stanzaId, fromMe: false, participant: quoted.sender,
@@ -70,6 +104,7 @@ module.exports = async (ctx) => {
       return
     }
 
+    // DM — just try
     await deleteMsg({ remoteJid: jid, id: quoted.stanzaId, fromMe: false })
     await deleteCommand()
     return
@@ -83,8 +118,7 @@ module.exports = async (ctx) => {
     if (bulkCount < 1)        return reply('❌ Please provide a valid number.')
 
     if (fromGroup) {
-      const botAdmin = await isBotAdmin(sock, jid)
-      if (!botAdmin) return reply('❌ I need to be an admin to bulk delete messages!')
+      if (!(await checkBotAdmin())) return
     }
 
     let targetNum = null
@@ -95,11 +129,12 @@ module.exports = async (ctx) => {
     }
 
     const stored = getStoredMessages(jid) || []
-    if (stored.length === 0) return reply(
-      '⚠️ *NO MESSAGES IN MEMORY*\n' +
-      '_Messages sent before deployment can\'t be recovered._\n' +
-      ''
-    )
+    if (!stored.length) {
+      return reply(
+        '⚠️ *NO MESSAGES IN MEMORY*\n' +
+        '_Messages sent before deployment cannot be recovered._'
+      )
+    }
 
     const pool = targetNum
       ? stored.filter(m => {
@@ -108,18 +143,22 @@ module.exports = async (ctx) => {
         })
       : stored
 
-    if (pool.length === 0) return reply('⚠️ *No messages found for that user in  memory.*')
+    if (!pool.length) return reply('⚠️ *No messages found for that user in memory.*')
 
-    const toDelete   = pool.slice(-bulkCount)
-    const requested  = toDelete.length
-
+    const toDelete  = pool.slice(-bulkCount)
+    const requested = toDelete.length
     let deleted = 0
     let failed  = 0
 
     for (const m of toDelete) {
       try {
         await sock.sendMessage(jid, {
-          delete: { remoteJid: jid, id: m.id, fromMe: m.fromMe ?? false, participant: m.sender }
+          delete: {
+            remoteJid:   jid,
+            id:          m.id,
+            fromMe:      m.fromMe ?? false,
+            participant: m.sender,
+          }
         })
         deleted++
       } catch (_) { failed++ }
@@ -133,8 +172,7 @@ module.exports = async (ctx) => {
         '🗑️ *BULK DELETE COMPLETE*\n' +
         '✅ *Deleted:* ' + deleted + '/' + requested + '\n' +
         (targetNum ? '👤 *Target:* @' + targetNum + '\n' : '') +
-        (failed > 0 ? '⚠️ *Failed:* ' + failed + ' (too old for WhatsApp)\n' : '') +
-        '',
+        (failed > 0 ? '⚠️ *Failed:* ' + failed + ' (too old for WhatsApp)\n' : ''),
       mentions: targetNum ? [targetNum + '@s.whatsapp.net'] : [],
     })
     return
@@ -148,7 +186,7 @@ module.exports = async (ctx) => {
     '📌 Reply to a message → *' + prefix + 'delete*\n' +
     '🗑️ Bulk delete last N → *' + prefix + 'delete 20*\n' +
     '👤 Bulk by user → *' + prefix + 'delete 20 @user*\n' +
-    '_Max bulk: ' + MAX_BULK + ' messages_\n' +
-    ''
+    '_Max bulk: ' + MAX_BULK + ' messages_'
   )
 }
+
