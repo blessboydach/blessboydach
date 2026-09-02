@@ -1,0 +1,209 @@
+[
+  {
+    "name": "👑 OWNER",
+    "commands": [
+    "all", "ban", "block", "broadcast", "channeljid", "chjid", "clearban",
+      "cleartemp", "delete", "dump", "exit", "gcp", "getpp", "groups", "inbox",
+      "join", "lastseen", "leave", "listban", "listblocked", "listp",
+      "mode", "online", "ppp", "private", "public", "resetmenuimg",
+      "restart", "setbotname", "setownername", "setownernumber",
+      "setmenuimg", "setpp", "temprepo", "unban", "unbanall", "unblock",
+      "update", "vanguardsend", "vanguardspam", "vanguardspam2",
+      "vanguardspam3", "vv", "vv2",
+      "phrasecommand", "phrasecommandset", "phrasecommanddel", "phrasecommandlist", "phrasecommandclear",
+      "pcommand", "pcommandset", "pcommanddel", "pcommandlist", "pcommandclear",
+      "setmenuvideo", "setmenustyle", "setmenucontext",
+      "pair", "pair2", "clear", "spam",
+      "emojicmd", "emojicmddel", "emojicmdset",
+      "stickercmd", "stickercmdset", "stickercmddel", "stickercmdlist",
+      "chatbotadd", "chatbotrem", "chatbotclear", "chatbotlist",
+      "cc", "cf"
+    ]
+  },
+  {
+    "name": "🔐 OWNER SECURITY",
+    "commands": [
+      "adddmban", "adddmsudo", "addgban", "addgsudo", "addignorelist",
+      "addsudo", "cleardmban", "cleardmsudo", "cleargban", "cleargsudo",
+      "clearignorelist", "clearsudo", "listdmban", "listdmsudo", "listgban",
+      "listgsudo", "listignorelist", "listsudo", "remdmban", "remdmsudo",
+      "remgban", "remgsudo", "remignorelist", "remsudo"
+    ]
+  },
+  {
+    "name": "⚙️ SETTINGS",
+    "commands": [
+      "alwayonline", "anticall", "anticallmode", "anticallmsg",
+      "anticallreset", "anticallstatus", "anticalltest", "antidelete",
+      "antideletestatus", "antiedit", "autobio", "autoreact",
+      "autoreactstatus", "autoread", "autorecord", "autorecordtype",
+      "autosavestatus", "autotype", "autoviewstatus", "chatbot",
+      "chatbotoff", "chatbotdms", "chatbotgc", "chatbotgroup", "chatbotall",
+      "close", "open", "setprefix", "statusemoji", "togstatus", "tostatus"
+    ]
+  },
+  {
+    "name": "🛡️ PRIVACY",
+    "commands": [
+      "addbadword", "antibadword", "antigroupmention", "antilink",
+      "antimedia", "antisticker", "resetlink", "toviewonce",
+      "antiviewonce", "antigroupstatus"
+    ]
+  },
+  {
+    "name": "🌍 MULTISESSION",
+    "commands": [
+      "setmode", "connect", "connect2", "disconnect", "disconnectall",
+      "delbot", "delbotall", "listbots", "botheap", "offload", "offloadall"
+    ]
+  },
+  {
+    "name": "📡 INFO",
+    "commands": [
+      "alive", "botstatus", "check", "device", "getsettings", "gset",
+      "help", "ms", "owner", "ping", "ping2", "repo", "runtime",
+      "speed", "status", "time", "totalmembers", "uptime", "userid"
+    ]
+  },
+  {
+    "name": "🤖 AI",
+    "commands": [
+      "claude", "gemini", "gpt", "grok", "meta", "liama", "meta",
+      "story", "vangai"
+    ]
+  },
+  {
+    "name": "👥 GROUP",
+    "commands": [
+      "active", "add", "admins", "antispam", "antibot", "antitagadmin", "antitagmem",
+      "approve", "approveall", "cancel", "cancelkick", "cancelkickinactive",
+      "closetime", "demote", "gcgc", "gcgc2", "goodbye", "googbye",
+      "groupinfo", "groupreset", "hidetag", "kick", "kickall",
+      "kickinactive", "link", "listactive", "listinactive", "lock",
+      "locktime", "members", "mtag", "opentime", "poll", "promactive",
+      "promote", "remove", "resetlink", "setdesc", "setgpp",
+      "setgroupname", "stalk", "tagall", "topactive", "warn", "welcome",
+      "gstatus", "togstatus"
+    ]
+  },
+  {
+    "name": "🛠️ TOOLS & UTILITY",
+    "commands": [
+      "archive", "base64", "binary", "calculate", "cb", "clipboard",
+      "genpass", "getfile", "gfile", "morse", "qrcode", "sentence",
+      "shazam", "steal", "sticker", "stream", "take", "toimage",
+      "toimg", "tomp4", "tovideo", "unarchive", "upload", "vcf",
+      "image", "find", "analyse", "ss", "contacts"
+    ]
+  },
+  {
+    "name": "🎵 SOUND MAGIC FX",
+    "commands": [
+      "audiofx", "bass", "blown", "chipmunk", "deep", "earrape",
+      "fast", "fat", "nightcore", "reverse", "robot", "slow",
+      "toaudio", "tts", "tts2", "tts3"
+    ]
+  },
+  {
+    "name": "🎨 TEXT MAKER",
+    "commands": [
+      "1917", "arena", "blankpink", "devil", "fire", "glitch",
+      "hacker", "ice", "leaves", "light", "matrix", "metallic",
+      "neon", "purple", "sand", "snow", "thunder"
+    ]
+  },
+  {
+    "name": "🎨 EPHOTO EFFECTS",
+    "commands": [
+      "1917style", "advancedglow", "blackpinklogo", "blackpinkstyle",
+      "cartoonstyle", "deletingtext", "dragonball", "effectclouds",
+      "flag3dtext", "flagtext", "galaxystyle", "glitchtext",
+      "glowingtext", "gradienttext", "graffiti", "incandescent",
+      "lighteffects", "luxurygold", "makingneon", "matrix",
+      "multicoloredneon", "neonglitch", "papercutstyle", "pixelglitch",
+      "royaltext", "sand", "summerbeach", "topography", "typography",
+      "watercolortext", "writetext"
+    ]
+  },
+  {
+    "name": "🥷 ANIME",
+    "commands": [
+      "anime", "hneko", "hwaifu", "konachan", "loli", "megumin",
+      "milf", "neko", "random", "waifu"
+    ]
+  },
+  {
+    "name": "⬇️ DOWNLOADER",
+    "commands": [
+      "facebook", "iplay", "iplay2", "instagram", "ig", "music", "music2",
+      "play", "play2", "song", "song2", "spotify", "telesticker",
+      "tiktok", "tt", "video", "video2",
+      "hentaidl", "hentai", "xxsearch", "xndl", "xnsearch", "xxdl",
+      "app", "mediafire", "pinterest", "twitter"
+    ]
+  },
+  {
+    "name": "👁️ STATUS",
+    "commands": ["fetch", "fetch2", "save", "save2", "vv", "vv2"]
+  },
+  {
+    "name": "🌸 FUN & MISC",
+    "commands": [
+      "8ball", "apk", "bible", "compliment", "dare", "didyk",
+      "emojimix", "fact", "flirt", "goodnight", "impressive", "joke",
+      "lyrics", "meme", "menu", "quote", "quran", "rate", "roast",
+      "say", "ship", "tag", "translate", "truth", "wasted", "weather"
+    ]
+  },
+  {
+    "name": "🎮 GAME",
+    "commands": ["coin", "dice", "guess", "move", "quizz", "rps", "tictactoe"]
+  },
+  {
+    "name": "💰 ECONOMY",
+    "commands": [
+      "balance", "daily", "farm", "ffarm", "leaderboard", "rob",
+      "transfer", "work"
+    ]
+  },
+  {
+    "name": "🗿 MANGA",
+    "commands": [
+      "akira", "akiyama", "anna", "asuna", "ayuzawa", "boruto", "chiho",
+      "chitoge", "deidara", "eba", "elaina", "emilia", "erza", "hestia",
+      "hinata", "inori", "isuzu", "itachi", "itori", "kaga", "kagura",
+      "kaori", "keneki", "kotori", "kurumi", "madara", "mikasa", "miku",
+      "minato", "naruto", "nezuko", "sagiri", "sakura", "sasuke"
+    ]
+  },
+  {
+    "name": "⚽️ FOOTBALL",
+    "commands": [
+      "leagues", "live", "epltable", "pl", "cl", "laliga",
+      "bundesliga", "seriea", "ligue1", "standings pl", "fixtures pl",
+      "results pl", "topscorers pl"
+    ]
+  },
+  {
+    "name": "📖 EDUCATION",
+    "commands": [
+      "bookid", "booksearch", "chemistry", "maths", "physics",
+      "dictionary", "grammar", "randompoem", "fruitinfo"
+    ]
+  },
+  {
+    "name": "🎤 MAGIC SOUND",
+    "commands": [
+      "nahida", "nami", "annah", "optimusprime", "goku",
+      "elonmusk", "mickeymouse", "kendrick", "angella", "eminem"
+    ]
+  },
+  {
+    "name": "🔤 WRITING",
+    "commands": [
+      "arrows", "asian", "binary", "braille", "bubble", "cherokee",
+      "circled", "circlenegative", "currency", "cyrillic", "diacritics",
+      "dotted", "doublestruck", "doubleunderlined"
+    ]
+  }
+]
