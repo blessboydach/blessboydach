@@ -1,0 +1,164 @@
+// ============================================================
+// VANGUARD MD — lib/audioDownloader.js
+// Song downloader using Keith API (search + audio download)
+// + WhatsApp‑compatible MP3 conversion
+// ============================================================
+
+const axios = require('axios')
+const config = require('../config')
+const defaults = require('../defaults')
+const { toAudio } = require('./convert')
+
+// Keith API base URL
+const KEITH_API_BASE = 'https://apiskeith2-production-3020.up.railway.app'
+
+const sanitizeFileName = (name) => {
+  return String(name || 'media')
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim() || 'media'
+}
+
+/**
+ * Search YouTube videos via Keith
+ * GET /search/yts?query=<keyword>
+ * Returns the first result
+ */
+async function searchVideo(query) {
+  const url = `${KEITH_API_BASE}/search/yts?query=${encodeURIComponent(query)}`
+  const { data } = await axios.get(url, { timeout: 15000 })
+
+  if (!data?.status || !data?.result?.length) {
+    throw new Error(data?.message || 'No results found on YouTube.')
+  }
+
+  const first = data.result[0]
+  return {
+    videoUrl: `https://youtube.com/watch?v=${first.id}`,
+    title: first.title || 'audio',
+    duration: first.duration,
+    views: first.views,
+    published: first.published,
+    thumbnail: first.thumbnail,
+    id: first.id
+  }
+}
+
+/**
+ * Get audio download link via Keith
+ * GET /download/audio?url=<youtube_url>
+ * Returns a direct MP3 download URL
+ */
+async function getDownloadInfo(videoUrl) {
+  const url = `${KEITH_API_BASE}/download/audio?url=${encodeURIComponent(videoUrl)}`
+  const { data } = await axios.get(url, { timeout: 15000 })
+
+  if (!data?.status || !data?.result) {
+    throw new Error(data?.message || 'Failed to get download link')
+  }
+
+  return {
+    downloadUrl: data.result // direct audio URL
+  }
+}
+
+/**
+ * Download audio buffer from URL
+ */
+async function downloadBuffer(url) {
+  const res = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 60000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+  })
+  return Buffer.from(res.data)
+}
+
+module.exports = async (ctx, mode = 'audio') => {
+  const { sock, msg, jid, args, reply, react } = ctx
+  const query = args.join(' ').trim()
+
+  if (!query) {
+    return reply(`❌ Usage: .${ctx.command} <song name or YouTube link>`)
+  }
+
+  const botName = config.botName || defaults.botName || 'VANGUARD MD'
+  let videoUrl, title, duration, views, published
+
+  try {
+    // ── 1. Search phase ──────────────────────────────────────
+    await react('🔍')
+
+    // Check if it's already a YouTube link
+    if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(query)) {
+      videoUrl = query
+      title = 'audio'
+    } else {
+      const searchResult = await searchVideo(query)
+      videoUrl = searchResult.videoUrl
+      title = searchResult.title
+      duration = searchResult.duration
+      views = searchResult.views
+      published = searchResult.published
+    }
+
+    // ── 2. Get download link ──────────────────────────────────
+    await react('⏳')
+
+    const { downloadUrl } = await getDownloadInfo(videoUrl)
+
+    // ── 3. Download the audio ──────────────────────────────────
+    let buffer = await downloadBuffer(downloadUrl)
+    if (!buffer.length) {
+      await react('❌')
+      return reply('❌ Downloaded audio buffer is empty.')
+    }
+
+    // ── 4. Convert to WhatsApp‑compatible MP3 ──────────────────
+    try {
+      buffer = await toAudio(buffer, 'mp3')
+    } catch (convErr) {
+      console.error('MP3 conversion failed:', convErr.message)
+      // fallback: keep original buffer
+    }
+
+    // ── 5. Build and send ──────────────────────────────────
+    const finalTitle = title || 'audio'
+    const fileName = sanitizeFileName(finalTitle) + '.mp3'
+
+    let caption = `*${finalTitle}*`
+    if (duration) caption += `\n*Duration:* ${duration}`
+    if (views) caption += `\n*Views:* ${views}`
+    if (published) caption += `\n*Published:* ${published}`
+    caption += `\n\n> _Powered by ${botName}_`
+
+    if (mode === 'document') {
+      await sock.sendMessage(jid, {
+        document: buffer,
+        mimetype: 'audio/mpeg',
+        fileName,
+        caption
+      }, { quoted: msg })
+    } else {
+      await sock.sendMessage(jid, {
+        audio: buffer,
+        mimetype: 'audio/mpeg',
+        ptt: false,
+        fileName,
+        caption
+      }, { quoted: msg })
+    }
+
+    await react('✅')
+    setTimeout(() => {
+      sock.sendMessage(jid, { react: { text: '', key: msg.key } }).catch(() => {})
+    }, 3000)
+
+  } catch (err) {
+    console.error('Song command error:', err)
+    await react('❌')
+    await reply(`❌ Failed to download song. ${err.message || 'Please try again later.'}`)
+  }
+}
